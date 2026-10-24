@@ -57,7 +57,8 @@ D:\Apps\scrcpy\
 ## 工作方式和限制
 
 - Windows Forms 独立程序，通过窗口跟随和左 Alt 快捷键控制 scrcpy，没有修改 scrcpy 本体。
-- 启动时，如果同目录的 scrcpy 已有投屏窗口，会附加工具栏；否则启动 `scrcpy.exe --shortcut-mod=lalt --stay-awake`。
+- 启动时，如果同目录的 scrcpy 已有投屏窗口，会附加工具栏；否则启动 `scrcpy.exe --shortcut-mod=lalt --stay-awake --video-bit-rate=20M --max-fps=60`。
+- 工具栏启动的默认画质为 20 Mbps、60 FPS，适合高分辨率平板。正在运行的已有投屏不会被工具栏改参数，需关闭后重新通过工具栏启动才会应用。
 - 使用同目录自带的 `adb.exe`，只为子进程设置 ADB 路径，不改系统环境变量。
 - 当前一次管理一个投屏窗口；多个设备时请先让 scrcpy 选定设备并打开投屏，再运行工具栏。
 - 附加已有投屏时，要求它使用左 Alt 快捷键。直接双击 scrcpy 本身不会自动启动工具栏。

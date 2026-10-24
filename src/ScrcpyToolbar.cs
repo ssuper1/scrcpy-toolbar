@@ -31,6 +31,8 @@ internal static class Program
 
 internal sealed class Toolbar : Form
 {
+    private const string DefaultVideoBitRate = "20M";
+    private const string DefaultMaxFps = "60";
     private readonly string root = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
     private readonly System.Windows.Forms.Timer follow = new System.Windows.Forms.Timer();
     private readonly ToolTip tips = new ToolTip();
@@ -254,7 +256,9 @@ internal sealed class Toolbar : Form
 
         logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "scrcpy.log");
         File.WriteAllText(logPath, "scrcpy 工具栏启动日志 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + Environment.NewLine, Encoding.UTF8);
-        var info = new ProcessStartInfo(exe, "--shortcut-mod=lalt --stay-awake") {
+        var info = new ProcessStartInfo(exe,
+            "--shortcut-mod=lalt --stay-awake --video-bit-rate=" + DefaultVideoBitRate +
+            " --max-fps=" + DefaultMaxFps) {
             WorkingDirectory = root, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardOutput = true, RedirectStandardError = true
         };
