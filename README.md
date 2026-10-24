@@ -4,7 +4,7 @@ Windows 上的 scrcpy 按钮工具栏：返回、桌面、任务、关屏、亮�
 
 ## 先看这里：下载什么，放在哪里
 
-**普通用户请下载 [Releases 最新版本](https://github.com/ssuper1/scrcpy-toolbar/releases/latest) 中的 `scrcpy-toolbar-v0.1.0-windows.zip`，解压后使用。无需编译，也无需安装。** GitHub 自动提供的 `Source code (zip)` / `Source code (tar.gz)` 是源码，不包含编译好的程序。
+**普通用户请下载 [Releases 最新版本](https://github.com/ssuper1/scrcpy-toolbar/releases/latest) 中的 `scrcpy-toolbar-v0.3.0-windows.zip`，解压后使用。无需编译，也无需安装。** GitHub 自动提供的 `Source code (zip)` / `Source code (tar.gz)` 是源码，不包含编译好的程序。
 
 **scrcpy 本身可以放在任意当前用户可写的目录；本工具的 `toolbar` 文件夹必须放在 scrcpy 的目录里面，与 `scrcpy.exe` 相邻。** 不必使用作者电脑上的路径，不建议放在需要管理员权限才能写入的目录。不能单独把工具栏 EXE 移到桌面，也不能在压缩包内直接运行。
 
@@ -58,7 +58,8 @@ D:\Apps\scrcpy\
 
 - Windows Forms 独立程序，通过窗口跟随和左 Alt 快捷键控制 scrcpy，没有修改 scrcpy 本体。
 - 启动时，如果同目录的 scrcpy 已有投屏窗口，会附加工具栏；否则启动 `scrcpy.exe --shortcut-mod=lalt --stay-awake --video-bit-rate=20M --max-fps=60`。
-- 工具栏启动的默认画质为 20 Mbps、60 FPS，适合高分辨率平板。正在运行的已有投屏不会被工具栏改参数，需关闭后重新通过工具栏启动才会应用。
+- 工具栏启动的默认画质为 20 Mbps、60 FPS，适合高分辨率平板。
+- 「画质」按钮可切换流畅 8M/30 FPS、标准 12M/60 FPS、高清 20M/60 FPS、超清 40M/60 FPS；切换时会自动重启当前投屏。
 - 使用同目录自带的 `adb.exe`，只为子进程设置 ADB 路径，不改系统环境变量。
 - 当前一次管理一个投屏窗口；多个设备时请先让 scrcpy 选定设备并打开投屏，再运行工具栏。
 - 附加已有投屏时，要求它使用左 Alt 快捷键。直接双击 scrcpy 本身不会自动启动工具栏。
@@ -72,6 +73,8 @@ D:\Apps\scrcpy\
 **手机插着但没有投屏：** 检查 USB 调试授权、数据线和设备驱动。通过本工具启动时，故障日志会写到 `toolbar\scrcpy.log`。日志可能包含设备信息，公开分享前请先检查。
 
 **按钮没有反应：** 先点击一下投屏画面再操作。工具栏和 scrcpy 应以相同权限运行；已有 scrcpy 窗口也应使用左 Alt 快捷键。若自行更改过 scrcpy 参数，关闭原投屏后通过本工具重新启动。
+
+**分辨率已经很高但画面仍然发糊：** `toolbar\scrcpy.log` 中的 `Texture: 宽x高` 是实际传输分辨率。若它等于平板分辨率，模糊通常来自视频压缩或电脑窗口缩放；先选择「超清」，再把投屏窗口调整到接近原始宽高比例。电脑显示器分辨率低于平板时，放大查看会受到显示器像素限制。
 
 **没有写入权限：** 将整个 scrcpy 文件夹放到当前用户可写的位置，例如自己的下载目录或自建应用目录。
 
@@ -89,7 +92,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
-输出为 `dist\scrcpy-toolbar-v0.1.0-windows.zip` 和对应 SHA-256 校验文件。发布包通过明确的文件清单构建，不包含本地日志、备份、快捷方式或设备信息。
+输出为 `dist\scrcpy-toolbar-v0.3.0-windows.zip` 和对应 SHA-256 校验文件。发布包通过明确的文件清单构建，不包含本地日志、备份、快捷方式或设备信息。
 
 ## 开源许可
 

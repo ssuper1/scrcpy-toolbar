@@ -29,16 +29,35 @@ internal static class Program
     }
 }
 
+internal sealed class QualityPreset
+{
+    internal readonly string Name;
+    internal readonly string BitRate;
+    internal readonly string MaxFps;
+
+    internal QualityPreset(string name, string bitRate, string maxFps)
+    {
+        Name = name;
+        BitRate = bitRate;
+        MaxFps = maxFps;
+    }
+}
+
 internal sealed class Toolbar : Form
 {
-    private const string DefaultVideoBitRate = "20M";
-    private const string DefaultMaxFps = "60";
+    private static readonly QualityPreset[] QualityPresets = {
+        new QualityPreset("流畅", "8M", "30"),
+        new QualityPreset("标准", "12M", "60"),
+        new QualityPreset("高清", "20M", "60"),
+        new QualityPreset("超清", "40M", "60")
+    };
     private readonly string root = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
     private readonly System.Windows.Forms.Timer follow = new System.Windows.Forms.Timer();
     private readonly ToolTip tips = new ToolTip();
     private readonly Label status = new Label();
     private readonly List<Button> actions = new List<Button>();
     private Button fullscreenButton;
+    private Button qualityButton;
     private Button foldButton;
     private Label heading;
     private int expandedHeight;
@@ -51,6 +70,9 @@ internal sealed class Toolbar : Form
     private Process mirror;
     private IntPtr target;
     private bool ready, closing, preferLeft, fullscreen, raisedForFullscreen, exitRequested;
+    private bool restarting, mirrorQualityKnown;
+    private QualityPreset quality = QualityPresets[2];
+    private ContextMenuStrip qualityMenu;
     private float scale;
     private string logPath;
 
@@ -94,6 +116,24 @@ internal sealed class Toolbar : Form
         AddAction("音量 +", "增加音量 · Alt+↑", 0x26, false, ref y);
         AddAction("音量 −", "降低音量 · Alt+↓", 0x28, false, ref y);
         y += 4;
+        qualityButton = MakeButton("画质", new Rectangle(7, y, 74, 32));
+        qualityButton.Click += delegate { ShowQualityMenu(); };
+        actions.Add(qualityButton);
+        qualityMenu = new ContextMenuStrip();
+        foreach (QualityPreset preset in QualityPresets)
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem(
+                preset.Name + "（" + preset.BitRate + " / " + preset.MaxFps + " FPS）");
+            item.Tag = preset;
+            item.Click += delegate(object sender, EventArgs e) {
+                QualityPreset selected = (QualityPreset)((ToolStripMenuItem)sender).Tag;
+                qualityMenu.Close();
+                ApplyQuality(selected);
+            };
+            qualityMenu.Items.Add(item);
+        }
+        tips.SetToolTip(qualityButton, "当前画质：高清（20M / 60 FPS），点击切换；切换时会重启投屏");
+        y += 36;
         fullscreenButton = AddAction("全屏", "全屏 / 退出全屏 · Alt+F", 0x46, false, ref y);
         AddAction("旋转", "旋转设备屏幕 · Alt+R", 0x52, false, ref y);
         AddAction("通知", "展开通知栏 · Alt+N", 0x4E, false, ref y);
@@ -136,7 +176,7 @@ internal sealed class Toolbar : Form
         follow.Interval = 120;
         follow.Tick += Poll;
         Shown += delegate { StartMirror(); follow.Start(); };
-        FormClosed += delegate { closing = true; follow.Stop(); follow.Dispose(); tips.Dispose(); };
+        FormClosed += delegate { closing = true; follow.Stop(); follow.Dispose(); qualityMenu.Dispose(); tips.Dispose(); };
     }
 
     protected override bool ShowWithoutActivation { get { return true; } }
@@ -236,6 +276,42 @@ internal sealed class Toolbar : Form
         return b;
     }
 
+    private void ShowQualityMenu()
+    {
+        if (!ready || restarting) return;
+        foreach (ToolStripMenuItem item in qualityMenu.Items)
+        {
+            QualityPreset preset = (QualityPreset)item.Tag;
+            item.Checked = preset.BitRate == quality.BitRate && preset.MaxFps == quality.MaxFps;
+        }
+        qualityMenu.Show(qualityButton, new Point(qualityButton.Width, 0));
+    }
+
+    private void ApplyQuality(QualityPreset selected)
+    {
+        if (!ready || restarting || mirror == null || !Native.IsWindow(target)) return;
+        if (mirrorQualityKnown && selected.BitRate == quality.BitRate && selected.MaxFps == quality.MaxFps)
+        {
+            tips.Show("当前已经是" + selected.Name + "（" + selected.BitRate + " / " + selected.MaxFps + " FPS）",
+                this, S(5), Height - S(20), 2200);
+            return;
+        }
+        uint pid;
+        Native.GetWindowThreadProcessId(target, out pid);
+        if (pid != (uint)mirror.Id) return;
+        quality = selected;
+        restarting = true;
+        exitRequested = false;
+        status.Text = "正在切换画质";
+        foreach (Button b in actions) b.Enabled = false;
+        if (!Native.PostMessage(target, 0x0010, IntPtr.Zero, IntPtr.Zero))
+        {
+            restarting = false;
+            foreach (Button b in actions) b.Enabled = true;
+            tips.Show("切换画质失败，请先关闭投屏后重新启动。", this, S(5), Height - S(20), 2800);
+        }
+    }
+
     private void StartMirror()
     {
         string exe = Path.Combine(root, "scrcpy.exe");
@@ -247,18 +323,24 @@ internal sealed class Toolbar : Form
             {
                 if (p.MainWindowHandle != IntPtr.Zero &&
                     string.Equals(p.MainModule.FileName, exe, StringComparison.OrdinalIgnoreCase))
-                { mirror = p; break; }
+                { mirror = p; mirrorQualityKnown = false; break; }
             }
             catch { }
             p.Dispose();
         }
         if (mirror != null) return;
 
+        LaunchMirror();
+    }
+
+    private void LaunchMirror()
+    {
+        string exe = Path.Combine(root, "scrcpy.exe");
         logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "scrcpy.log");
         File.WriteAllText(logPath, "scrcpy 工具栏启动日志 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + Environment.NewLine, Encoding.UTF8);
         var info = new ProcessStartInfo(exe,
-            "--shortcut-mod=lalt --stay-awake --video-bit-rate=" + DefaultVideoBitRate +
-            " --max-fps=" + DefaultMaxFps) {
+            "--shortcut-mod=lalt --stay-awake --video-bit-rate=" + quality.BitRate +
+            " --max-fps=" + quality.MaxFps) {
             WorkingDirectory = root, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardOutput = true, RedirectStandardError = true
         };
@@ -269,6 +351,7 @@ internal sealed class Toolbar : Form
         mirror.Start();
         mirror.BeginOutputReadLine();
         mirror.BeginErrorReadLine();
+        mirrorQualityKnown = true;
     }
     private void LogLine(object sender, DataReceivedEventArgs e)
     {
@@ -288,6 +371,18 @@ internal sealed class Toolbar : Form
             mirror.Refresh();
             if (mirror.HasExited)
             {
+                if (restarting)
+                {
+                    mirror.Dispose();
+                    mirror = null;
+                    target = IntPtr.Zero;
+                    ready = false;
+                    exitRequested = false;
+                    startup.Restart();
+                    restarting = false;
+                    LaunchMirror();
+                    return;
+                }
                 follow.Stop();
                 if (!ready) ShowStartupError();
                 Close(); return;

@@ -1,10 +1,10 @@
-# v0.2.0
+# v0.3.0
 
-为 Windows scrcpy 增加可拖动、可收起的侧边按钮工具栏，并将默认视频质量调整为 20 Mbps、60 FPS。
+为 Windows scrcpy 增加可拖动、可收起的侧边按钮工具栏，并提供可调节的视频质量档位。
 
 ## 下载与安装
 
-下载附件 **scrcpy-toolbar-v0.1.0-windows.zip**。解压后把整个 **toolbar** 文件夹放进已有 scrcpy 目录，再双击 **toolbar\ScrcpyToolbar.exe**。可运行 **create-desktop-shortcut.vbs** 创建桌面快捷方式。
+下载附件 **scrcpy-toolbar-v0.3.0-windows.zip**。解压后把整个 **toolbar** 文件夹放进已有 scrcpy 目录，再双击 **toolbar\ScrcpyToolbar.exe**。可运行 **create-desktop-shortcut.vbs** 创建桌面快捷方式。
 
 scrcpy 可以放在任意当前用户可写的目录，但 toolbar 必须位于其中。需要单独下载官方 scrcpy，运行包不包含 scrcpy 或 ADB。自动生成的 Source code 压缩包只提供源码。
 
@@ -16,6 +16,7 @@ scrcpy 可以放在任意当前用户可写的目录，但 toolbar 必须位于�
 - 退出投屏按钮以及 × 同时关闭投屏和工具栏。
 - 使用 scrcpy 自带 ADB，不修改系统环境变量。
 - 通过工具栏新启动的投屏默认使用 `--video-bit-rate=20M --max-fps=60`。
+- 新增「画质」按钮：流畅 8M/30 FPS、标准 12M/60 FPS、高清 20M/60 FPS、超清 40M/60 FPS；切换时自动重启投屏。
 
 ## 验证范围
 
