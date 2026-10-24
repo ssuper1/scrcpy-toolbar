@@ -1,0 +1,8 @@
+/dist/
+*.log
+*.lnk
+*.exe
+*.pdb
+*.zip
+backup*/
+.vs/
