@@ -78,6 +78,9 @@ internal sealed class Toolbar : Form
     private ContextMenuStrip qualityMenu;
     private ContextMenuStrip keyboardMenu;
     private DesktopInputForm desktopInput;
+    private readonly MirrorKeyboardLayout keyboardLayout = new MirrorKeyboardLayout();
+    private ToolStripMenuItem directShiftItem;
+    private bool directShift = true;
     private string keyboardMode = "uhid";
     private bool keyboardModeKnown;
     private readonly string settingsPath = Path.Combine(
@@ -98,6 +101,9 @@ internal sealed class Toolbar : Form
             string saved = File.ReadAllText(settingsPath).Trim();
             if (saved == "uhid" || saved == "sdk") keyboardMode = saved;
         }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        try { directShift = File.ReadAllText(Path.Combine(Path.GetDirectoryName(settingsPath), "direct-shift.txt")).Trim() != "off"; }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
         using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) scale = g.DpiX / 96f;
@@ -165,27 +171,41 @@ internal sealed class Toolbar : Form
         actions.Add(keyboardButton);
         y += 36;
         keyboardMenu = new ContextMenuStrip();
-        ToolStripMenuItem desktopTyping = new ToolStripMenuItem("电脑输入（推荐，使用电脑输入法选词）");
-        desktopTyping.Click += delegate { OpenDesktopInput(); };
-        keyboardMenu.Items.Add(desktopTyping);
-        keyboardMenu.Items.Add(new ToolStripSeparator());
-        AddKeyboardMode("手机输入法模式（实体键盘）", "uhid");
+        AddKeyboardMode("直接输入（实体键盘，推荐）", "uhid");
         AddKeyboardMode("兼容模式（英文 / 数字，中文用粘贴）", "sdk");
+        directShiftItem = new ToolStripMenuItem("Shift 直通手机（避免电脑输入法拦截）");
+        directShiftItem.CheckOnClick = true;
+        directShiftItem.Checked = directShift;
+        directShiftItem.Click += delegate {
+            directShift = directShiftItem.Checked;
+            try {
+                Directory.CreateDirectory(Path.GetDirectoryName(settingsPath));
+                File.WriteAllText(Path.Combine(Path.GetDirectoryName(settingsPath), "direct-shift.txt"), directShift ? "on" : "off");
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            UpdateDirectKeyboard();
+            if (directShift && (!keyboardModeKnown || keyboardMode != "uhid")) ApplyKeyboardMode("uhid");
+            UpdateKeyboardTip();
+        };
+        keyboardMenu.Items.Add(directShiftItem);
         keyboardMenu.Items.Add(new ToolStripSeparator());
         ToolStripMenuItem keyboardSettings = new ToolStripMenuItem("打开手机的实体键盘设置");
         keyboardSettings.Click += delegate { SendShortcut(0x4B, false); };
         keyboardMenu.Items.Add(keyboardSettings);
+        ToolStripMenuItem desktopTyping = new ToolStripMenuItem("备用：电脑输入窗（编辑后粘贴）");
+        desktopTyping.Click += delegate { OpenDesktopInput(); };
+        keyboardMenu.Items.Add(desktopTyping);
         ToolStripMenuItem keyboardHelp = new ToolStripMenuItem("怎么输入中文？");
         keyboardHelp.Click += delegate {
-            MessageBox.Show("推荐：选择“电脑输入”，在电脑输入窗内使用 Windows 输入法。\n" +
-                "中英文切换、数字选词都在电脑完成，再点“填入手机”。\n\n" +
-                "直接在投屏中打字则由手机输入法处理：\n" +
-                "1. 选择“手机输入法模式”，等待投屏重新连接。\n" +
-                "2. 在投屏里点击手机的输入框，再用电脑键盘打字。\n" +
-                "3. 中文由手机输入法处理；电脑输入法先切到英文状态。\n" +
-                "4. 首次使用可打开实体键盘设置，配置布局和支持实体键盘的中文输入法。\n\n" +
-                "若手机输入法不支持，可在电脑上输入中文并复制，再点工具栏“粘贴”。\n" +
-                "键盘只在投屏窗口获得焦点时输入，切回电脑应用后正常操作电脑。",
+            MessageBox.Show("1. 选择“直接输入（实体键盘）”，勾选“Shift 直通手机”。\n" +
+                "2. 点击投屏里的手机输入框，直接打字。\n" +
+                "3. 单按 Shift 切换手机中英文；中文选词在手机候选区完成。\n\n" +
+                "直通时只把投屏窗口的电脑键盘布局固定为英文，避免 Windows 输入法拦截按键。\n" +
+                "因此电脑显示英文、手机输入中文是正常的，以手机输入法状态为准。\n" +
+                "Shift 切换和数字选词仍需手机输入法支持实体键盘。\n\n" +
+                "关闭“Shift 直通手机”会恢复投屏窗口原来的电脑键盘布局。\n" +
+                "如需在电脑选词，可使用备用电脑输入窗。",
                 "电脑键盘输入", MessageBoxButtons.OK, MessageBoxIcon.Information);
         };
         keyboardMenu.Items.Add(keyboardHelp);
@@ -229,6 +249,7 @@ internal sealed class Toolbar : Form
         follow.Tick += Poll;
         Shown += delegate { StartMirror(); follow.Start(); };
         FormClosed += delegate {
+            keyboardLayout.Dispose();
             closing = true; follow.Stop(); follow.Dispose(); qualityMenu.Dispose();
             keyboardMenu.Dispose(); tips.Dispose();
             if (desktopInput != null) desktopInput.Dispose();
@@ -389,10 +410,22 @@ internal sealed class Toolbar : Form
 
     private void UpdateKeyboardTip()
     {
-        tips.SetToolTip(keyboardButton, "推荐用“电脑输入”在 Windows 中选词后填入手机。\n" + (keyboardModeKnown
-            ? (keyboardMode == "uhid" ? "实体键盘：点击手机输入框后打字，中文由手机输入法处理"
+        tips.SetToolTip(keyboardButton, (directShift ? "Shift 直通手机：投屏窗口固定英文按键，手机输入法处理中英文。\n" : "Shift 直通已关闭。\n") + (keyboardModeKnown
+            ? (keyboardMode == "uhid" ? "直接输入：点击手机输入框后打字，Shift 切换手机中英文"
                 : "兼容键盘：直接输入英文和数字，中文可用粘贴")
             : "已有投屏的键盘模式未知；点击选择模式，重连后生效"));
+    }
+
+    private void UpdateDirectKeyboard()
+    {
+        keyboardLayout.Update(target, mirror == null ? 0u : (uint)mirror.Id,
+            ready && !restarting && !exitRequested && directShift && keyboardModeKnown && keyboardMode == "uhid");
+        if (keyboardLayout.Error != null)
+        {
+            status.Text = "键盘未直通";
+            tips.SetToolTip(keyboardButton, keyboardLayout.Error);
+        }
+        else if (status.Text == "键盘未直通") { status.Text = "已连接"; UpdateKeyboardTip(); }
     }
 
     private void OpenDesktopInput()
@@ -446,6 +479,7 @@ internal sealed class Toolbar : Form
         else if (Native.GetWindowRect(target, out rect))
             restartWindowArguments = " --window-x=" + rect.Left + " --window-y=" + rect.Top;
         restarting = true;
+        UpdateDirectKeyboard();
         restartWait.Restart();
         status.Text = message;
         foreach (Button b in actions) b.Enabled = false;
@@ -582,6 +616,7 @@ internal sealed class Toolbar : Form
             mirror.Refresh();
             if (mirror.HasExited)
             {
+                keyboardLayout.Update(IntPtr.Zero, 0, false);
                 if (restarting)
                 {
                     mirror.WaitForExit(1000);
@@ -643,6 +678,7 @@ internal sealed class Toolbar : Form
                 if (Visible) Hide();
                 return;
             }
+            UpdateDirectKeyboard();
             Reposition();
             if (!Visible) Show();
         }
@@ -745,6 +781,99 @@ internal sealed class Toolbar : Form
         if (sent != inputs.Count)
             tips.Show("按键发送失败，请让投屏和工具栏使用相同权限运行。", this, S(5), Height - S(20), 2500);
         return sent == inputs.Count;
+    }
+}
+
+// Change only the verified mirror thread's keyboard layout. A non-IME layout
+// lets SDL receive the original Shift/letter/number events instead of Windows
+// consuming them as a separate composition. UHID already forwards those events.
+internal sealed class MirrorKeyboardLayout : IDisposable
+{
+    private IntPtr window, original, english;
+    private uint processId, threadId;
+    private bool loadedEnglish, requested, restoreQueued;
+    private DateTime lastRequest, firstRequest;
+    internal string Error { get; private set; }
+
+    internal void Update(IntPtr target, uint expectedPid, bool enabled)
+    {
+        uint actualPid = 0;
+        uint actualThread = target == IntPtr.Zero ? 0 : Native.GetWindowThreadProcessId(target, out actualPid);
+        if (!enabled || expectedPid == 0 || actualPid != expectedPid || actualThread == 0)
+        {
+            Restore();
+            return;
+        }
+        if (window != target || processId != expectedPid || threadId != actualThread)
+        {
+            IntPtr priorOriginal = processId == expectedPid && threadId == actualThread ? original : IntPtr.Zero;
+            Restore();
+            window = target;
+            processId = expectedPid;
+            threadId = actualThread;
+            original = priorOriginal != IntPtr.Zero ? priorOriginal : Native.GetKeyboardLayout(threadId);
+            requested = false;
+            lastRequest = DateTime.MinValue;
+            firstRequest = DateTime.MinValue;
+        }
+        restoreQueued = false;
+        if (english == IntPtr.Zero)
+        {
+            int count = Native.GetKeyboardLayoutList(0, null);
+            IntPtr[] layouts = new IntPtr[count];
+            Native.GetKeyboardLayoutList(count, layouts);
+            bool alreadyLoaded = Array.IndexOf(layouts, new IntPtr(0x04090409)) >= 0;
+            // No KLF_ACTIVATE or registry changes: do not switch the foreground
+            // app's layout. WM_INPUTLANGCHANGEREQUEST below addresses scrcpy only.
+            english = Native.LoadKeyboardLayout("00000409", 0);
+            if (english != new IntPtr(0x04090409))
+            {
+                english = IntPtr.Zero;
+                Error = "无法加载英文按键布局，请关闭 Shift 直通后重试。";
+                return;
+            }
+            loadedEnglish = !alreadyLoaded;
+        }
+        if (Native.GetKeyboardLayout(threadId) == english) { Error = null; firstRequest = DateTime.MinValue; return; }
+        if ((DateTime.UtcNow - lastRequest).TotalMilliseconds < 500) return;
+        // Also prepare an attached/background mirror before the first click.
+        // Never activate it or synthesize a key while selecting its layout.
+        lastRequest = DateTime.UtcNow;
+        if (firstRequest == DateTime.MinValue) firstRequest = lastRequest;
+        bool posted = Native.PostMessage(window, 0x0050, IntPtr.Zero, english);
+        if (posted) requested = true;
+        if (!posted)
+            Error = "无法设置投屏键盘布局，请让投屏和工具栏使用相同权限运行。";
+        else if ((DateTime.UtcNow - firstRequest).TotalSeconds > 2)
+            Error = "投屏未接受英文按键布局，请关闭 Shift 直通后重试。";
+    }
+
+    private void Restore()
+    {
+        if (window == IntPtr.Zero || restoreQueued) return;
+        uint actualPid;
+        uint actualThread = Native.GetWindowThreadProcessId(window, out actualPid);
+        if (actualPid == processId && actualThread == threadId && original != IntPtr.Zero && original != english &&
+            (requested || Native.GetKeyboardLayout(threadId) == english))
+            Native.PostMessage(window, 0x0050, IntPtr.Zero, original);
+        // Keep the snapshot across rapid off/on changes. A posted English
+        // request may not have been processed yet; queue restoration after it.
+        restoreQueued = true;
+        requested = false;
+        Error = null;
+    }
+
+    public void Dispose()
+    {
+        Restore();
+        if (!loadedEnglish || english == IntPtr.Zero) return;
+        // Give a live mirror time to process the posted restore before unloading
+        // the temporary layout; never unload a layout it is still using.
+        for (int i = 0; i < 20 && threadId != 0 && Native.GetKeyboardLayout(threadId) == english; i++)
+            Thread.Sleep(10);
+        if (threadId == 0 || Native.GetKeyboardLayout(threadId) != english)
+            Native.UnloadKeyboardLayout(english);
+        english = IntPtr.Zero;
     }
 }
 
@@ -865,6 +994,10 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] internal static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] internal static extern IntPtr GetKeyboardLayout(uint threadId);
+    [DllImport("user32.dll")] internal static extern int GetKeyboardLayoutList(int count, [Out] IntPtr[] layouts);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern IntPtr LoadKeyboardLayout(string layout, uint flags);
+    [DllImport("user32.dll")] internal static extern bool UnloadKeyboardLayout(IntPtr layout);
     [DllImport("user32.dll")] internal static extern uint MapVirtualKey(uint code, uint mapType);
     [DllImport("user32.dll")] internal static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);

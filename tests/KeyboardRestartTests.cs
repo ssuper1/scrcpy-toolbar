@@ -30,6 +30,11 @@ internal static class KeyboardRestartTests
             File.WriteAllText(Path.Combine(testRoot, "adb.exe"), "not executed");
             Assembly assembly = Assembly.LoadFile(Path.GetFullPath(args[0]));
             toolbarType = assembly.GetType("Toolbar");
+            Type native = assembly.GetType("Native");
+            IntPtr otherWindow = (IntPtr)native.GetMethod("GetForegroundWindow", Fields).Invoke(null, null);
+            object[] otherArgs = new object[] { otherWindow, 0u };
+            uint otherThread = (uint)native.GetMethod("GetWindowThreadProcessId", Fields).Invoke(null, otherArgs);
+            IntPtr otherLayout = (IntPtr)native.GetMethod("GetKeyboardLayout", Fields).Invoke(null, new object[] { otherThread });
             TestDesktopInput(assembly);
             toolbar = (Form)Activator.CreateInstance(toolbarType);
             toolbar.Opacity = 0;
@@ -37,12 +42,14 @@ internal static class KeyboardRestartTests
             Set("settingsPath", Path.Combine(testRoot, "keyboard-mode.txt"));
             Set("logPath", Path.Combine(testRoot, "mirror.log"));
             Set("keyboardMode", "uhid");
+            Set("directShift", true);
             toolbar.Show();
             PumpUntil(delegate { return (bool)Get("ready"); });
             int firstPid = ((Process)Get("mirror")).Id;
             Assert((bool)Get("keyboardModeKnown"), "mode known on new launch");
             Assert(Arguments().Contains("--keyboard=uhid"), "default UHID argument");
             Assert(File.ReadAllText(Path.Combine(testRoot, "keyboard-mode.txt")) == "uhid", "default mode saved");
+            TestDirectKeyboard(native, otherThread, otherLayout);
 
             Call("ApplyKeyboardMode", "sdk");
             PumpUntil(delegate { return (bool)Get("ready") && ((Process)Get("mirror")).Id != firstPid; });
@@ -71,7 +78,7 @@ internal static class KeyboardRestartTests
             Call("ReadAttachedCommandLine", "scrcpy.exe --video-bit-rate=35M --max-fps=45 --keyboard=sdk --serial=test-device");
             Assert(Arguments().Contains("--video-bit-rate=35M") && Arguments().Contains("--max-fps=45"), "attached quality retained");
             Assert(Arguments().Contains("--serial=test-device"), "attached device retained");
-            Console.WriteLine("PASS: Desktop input Unicode, draft retention, composition guard, errors, focusable form; UHID/SDK restart, saved mode, quality/device retention, unknown attached mode, toolbar lifetime.");
+            Console.WriteLine("PASS: Mirror-only English layout, original layout restoration, PID guard, unrelated foreground layout unchanged; desktop input draft/composition; UHID/SDK restart and parameter retention.");
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
@@ -103,6 +110,40 @@ internal static class KeyboardRestartTests
     private static void Set(string field, object value) { toolbarType.GetField(field, Fields).SetValue(toolbar, value); }
     private static object Call(string method, params object[] args) { return toolbarType.GetMethod(method, Fields).Invoke(toolbar, args); }
     private static string Arguments() { return (string)Call("BuildMirrorArguments"); }
+    private static void TestDirectKeyboard(Type native, uint otherThread, IntPtr otherLayout)
+    {
+        object layout = Get("keyboardLayout");
+        Type layoutType = layout.GetType();
+        uint mirrorThread = (uint)layoutType.GetField("threadId", Fields).GetValue(layout);
+        IntPtr original = (IntPtr)layoutType.GetField("original", Fields).GetValue(layout);
+        MethodInfo getLayout = native.GetMethod("GetKeyboardLayout", Fields);
+        Func<IntPtr> current = delegate { return (IntPtr)getLayout.Invoke(null, new object[] { mirrorThread }); };
+        PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+        Assert((IntPtr)getLayout.Invoke(null, new object[] { otherThread }) == otherLayout, "other app keyboard layout unchanged after enabling direct input");
+
+        Set("directShift", false);
+        Call("UpdateDirectKeyboard");
+        PumpUntil(delegate { return current() == original; });
+        Assert((IntPtr)getLayout.Invoke(null, new object[] { otherThread }) == otherLayout, "other app keyboard layout unchanged after restoration");
+        layoutType.GetMethod("Update", Fields).Invoke(layout,
+            new object[] { Get("target"), (uint)((Process)Get("mirror")).Id + 1u, true });
+        Application.DoEvents();
+        Assert(current() == original, "wrong process identity cannot change layout");
+        layoutType.GetField("lastRequest", Fields).SetValue(layout, DateTime.MinValue);
+        Set("directShift", true);
+        Call("UpdateDirectKeyboard");
+        Set("directShift", false);
+        Call("UpdateDirectKeyboard");
+        // A fake-mirror acknowledgement fences all preceding posted layout
+        // messages, including an enable that was cancelled before processing.
+        string fence = Path.Combine((string)Get("root"), "layout-fence.txt");
+        native.GetMethod("PostMessage", Fields).Invoke(null, new object[] { Get("target"), 0x8001u, IntPtr.Zero, IntPtr.Zero });
+        PumpUntil(delegate { return File.Exists(fence); });
+        Assert(current() == original, "rapid disable restores layout after pending enable");
+        Set("directShift", true);
+        Call("UpdateDirectKeyboard");
+        PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+    }
     private static void TestDesktopInput(Assembly assembly)
     {
         Type inputType = assembly.GetType("DesktopInputForm");
@@ -159,6 +200,15 @@ internal static class KeyboardRestartTests
             Bounds = new Rectangle(50, 50, 400, 300);
         }
         protected override bool ShowWithoutActivation { get { return true; } }
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x8001)
+            {
+                File.WriteAllText(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "layout-fence.txt"), "done");
+                return;
+            }
+            base.WndProc(ref m);
+        }
         protected override CreateParams CreateParams
         {
             get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x80; return cp; }
