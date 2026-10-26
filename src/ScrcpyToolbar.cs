@@ -79,6 +79,8 @@ internal sealed class Toolbar : Form
     private ContextMenuStrip keyboardMenu;
     private DesktopInputForm desktopInput;
     private readonly MirrorKeyboardLayout keyboardLayout = new MirrorKeyboardLayout();
+    private Native.WinEventProc foregroundChanged;
+    private IntPtr foregroundHook;
     private ToolStripMenuItem directShiftItem;
     private bool directShift = true;
     private string keyboardMode = "uhid";
@@ -201,7 +203,7 @@ internal sealed class Toolbar : Form
             MessageBox.Show("1. 选择“直接输入（实体键盘）”，勾选“Shift 直通手机”。\n" +
                 "2. 点击投屏里的手机输入框，直接打字。\n" +
                 "3. 单按 Shift 切换手机中英文；中文选词在手机候选区完成。\n\n" +
-                "直通时只把投屏窗口的电脑键盘布局固定为英文，避免 Windows 输入法拦截按键。\n" +
+                "只有投屏获得焦点时才启用英文按键直通；切回电脑输入框会恢复输入法。\n" +
                 "因此电脑显示英文、手机输入中文是正常的，以手机输入法状态为准。\n" +
                 "Shift 切换和数字选词仍需手机输入法支持实体键盘。\n\n" +
                 "关闭“Shift 直通手机”会恢复投屏窗口原来的电脑键盘布局。\n" +
@@ -247,10 +249,21 @@ internal sealed class Toolbar : Form
         foreach (Button b in actions) b.Enabled = false;
         follow.Interval = 120;
         follow.Tick += Poll;
-        Shown += delegate { StartMirror(); follow.Start(); };
+        Shown += delegate {
+            foregroundChanged = delegate {
+                if (closing) return;
+                try { UpdateDirectKeyboard(); }
+                catch (InvalidOperationException) { }
+            };
+            foregroundHook = Native.SetWinEventHook(3, 3, IntPtr.Zero, foregroundChanged, 0, 0, 0);
+            UpdateDirectKeyboard();
+            StartMirror(); follow.Start();
+        };
         FormClosed += delegate {
+            closing = true;
+            if (foregroundHook != IntPtr.Zero) Native.UnhookWinEvent(foregroundHook);
             keyboardLayout.Dispose();
-            closing = true; follow.Stop(); follow.Dispose(); qualityMenu.Dispose();
+            follow.Stop(); follow.Dispose(); qualityMenu.Dispose();
             keyboardMenu.Dispose(); tips.Dispose();
             if (desktopInput != null) desktopInput.Dispose();
         };
@@ -410,7 +423,7 @@ internal sealed class Toolbar : Form
 
     private void UpdateKeyboardTip()
     {
-        tips.SetToolTip(keyboardButton, (directShift ? "Shift 直通手机：投屏窗口固定英文按键，手机输入法处理中英文。\n" : "Shift 直通已关闭。\n") + (keyboardModeKnown
+        tips.SetToolTip(keyboardButton, (directShift ? "Shift 直通：仅投屏获得焦点时启用，切回电脑自动恢复输入法。\n" : "Shift 直通已关闭。\n") + (keyboardModeKnown
             ? (keyboardMode == "uhid" ? "直接输入：点击手机输入框后打字，Shift 切换手机中英文"
                 : "兼容键盘：直接输入英文和数字，中文可用粘贴")
             : "已有投屏的键盘模式未知；点击选择模式，重连后生效"));
@@ -672,13 +685,13 @@ internal sealed class Toolbar : Form
                     catch (UnauthorizedAccessException) { }
                 }
             }
+            UpdateDirectKeyboard();
             if (Native.IsIconic(target) || !Native.IsWindowVisible(target))
             {
                 SetFullscreenLayer(false);
                 if (Visible) Hide();
                 return;
             }
-            UpdateDirectKeyboard();
             Reposition();
             if (!Visible) Show();
         }
@@ -792,18 +805,38 @@ internal sealed class MirrorKeyboardLayout : IDisposable
     private IntPtr window, original, english;
     private uint processId, threadId;
     private bool loadedEnglish, requested, restoreQueued;
+    private bool focused;
+    private IntPtr desktopLayout, pendingDesktop;
+    private DateTime pendingDesktopDeadline;
+    private readonly Dictionary<IntPtr, DesktopLayout> desktopLayouts = new Dictionary<IntPtr, DesktopLayout>();
     private DateTime lastRequest, firstRequest;
     internal string Error { get; private set; }
 
     internal void Update(IntPtr target, uint expectedPid, bool enabled)
     {
+        UpdateForForeground(target, expectedPid, enabled, Native.GetForegroundWindow());
+    }
+
+    // Explicit foreground input also lets tests exercise focus transitions with
+    // isolated invisible windows, without changing the user's actual focus.
+    internal void UpdateForForeground(IntPtr target, uint expectedPid, bool enabled, IntPtr foreground)
+    {
         uint actualPid = 0;
         uint actualThread = target == IntPtr.Zero ? 0 : Native.GetWindowThreadProcessId(target, out actualPid);
-        if (!enabled || expectedPid == 0 || actualPid != expectedPid || actualThread == 0)
+        bool active = enabled && expectedPid != 0 && actualPid == expectedPid && actualThread != 0 &&
+            foreground == target && !Native.IsIconic(target) && Native.IsWindowVisible(target);
+        if (!active)
         {
             Restore();
+            if (focused && foreground != target) RestoreDesktop(foreground);
+            focused = false;
+            if (foreground != target) RememberDesktop(foreground);
             return;
         }
+        // A focus session always starts a new request interval; never delay the
+        // first keystrokes because of a rate limit from the previous session.
+        if (!focused) { lastRequest = DateTime.MinValue; firstRequest = DateTime.MinValue; }
+        focused = true;
         if (window != target || processId != expectedPid || threadId != actualThread)
         {
             IntPtr priorOriginal = processId == expectedPid && threadId == actualThread ? original : IntPtr.Zero;
@@ -836,8 +869,8 @@ internal sealed class MirrorKeyboardLayout : IDisposable
         }
         if (Native.GetKeyboardLayout(threadId) == english) { Error = null; firstRequest = DateTime.MinValue; return; }
         if ((DateTime.UtcNow - lastRequest).TotalMilliseconds < 500) return;
-        // Also prepare an attached/background mirror before the first click.
-        // Never activate it or synthesize a key while selecting its layout.
+        // Called only while the verified mirror is the foreground window.
+        // Never activate a window or synthesize a key to select its layout.
         lastRequest = DateTime.UtcNow;
         if (firstRequest == DateTime.MinValue) firstRequest = lastRequest;
         bool posted = Native.PostMessage(window, 0x0050, IntPtr.Zero, english);
@@ -846,6 +879,52 @@ internal sealed class MirrorKeyboardLayout : IDisposable
             Error = "无法设置投屏键盘布局，请让投屏和工具栏使用相同权限运行。";
         else if ((DateTime.UtcNow - firstRequest).TotalSeconds > 2)
             Error = "投屏未接受英文按键布局，请关闭 Shift 直通后重试。";
+    }
+
+    private sealed class DesktopLayout
+    {
+        internal uint ProcessId, ThreadId;
+        internal IntPtr Layout;
+    }
+
+    private void RestoreDesktop(IntPtr foreground)
+    {
+        uint pid;
+        uint tid = Native.GetWindowThreadProcessId(foreground, out pid);
+        if (tid == 0) return;
+        IntPtr current = Native.GetKeyboardLayout(tid);
+        DesktopLayout saved;
+        IntPtr desired = desktopLayouts.TryGetValue(foreground, out saved) && saved.ProcessId == pid && saved.ThreadId == tid
+            ? saved.Layout : (desktopLayout != IntPtr.Zero ? desktopLayout : original);
+        // Windows can carry the mirror's English layout into the newly focused
+        // app when per-window input methods are disabled. Restore only this
+        // inherited layout, once on blur; leave a different app layout alone.
+        if (current != english || desired == IntPtr.Zero || desired == english) return;
+        if (Native.PostMessage(foreground, 0x0050, IntPtr.Zero, desired))
+        {
+            pendingDesktop = foreground;
+            pendingDesktopDeadline = DateTime.UtcNow.AddSeconds(2);
+        }
+    }
+
+    private void RememberDesktop(IntPtr foreground)
+    {
+        uint pid;
+        uint tid = Native.GetWindowThreadProcessId(foreground, out pid);
+        if (tid == 0) return;
+        IntPtr current = Native.GetKeyboardLayout(tid);
+        if (current == IntPtr.Zero) return;
+        // Do not record the inherited English layout while an asynchronous
+        // restoration is still queued. Once restored, normal manual changes
+        // in desktop apps become the baseline for the next focus session.
+        if (pendingDesktop == foreground)
+        {
+            if (current == english && DateTime.UtcNow < pendingDesktopDeadline) return;
+            pendingDesktop = IntPtr.Zero;
+        }
+        if (desktopLayouts.Count > 128) desktopLayouts.Clear();
+        desktopLayouts[foreground] = new DesktopLayout { ProcessId = pid, ThreadId = tid, Layout = current };
+        desktopLayout = current;
     }
 
     private void Restore()
@@ -866,6 +945,12 @@ internal sealed class MirrorKeyboardLayout : IDisposable
     public void Dispose()
     {
         Restore();
+        if (focused)
+        {
+            IntPtr foreground = Native.GetForegroundWindow();
+            if (foreground != window) RestoreDesktop(foreground);
+            focused = false;
+        }
         if (!loadedEnglish || english == IntPtr.Zero) return;
         // Give a live mirror time to process the posted restore before unloading
         // the temporary layout; never unload a layout it is still using.
@@ -998,6 +1083,10 @@ internal static class Native
     [DllImport("user32.dll")] internal static extern int GetKeyboardLayoutList(int count, [Out] IntPtr[] layouts);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern IntPtr LoadKeyboardLayout(string layout, uint flags);
     [DllImport("user32.dll")] internal static extern bool UnloadKeyboardLayout(IntPtr layout);
+    internal delegate void WinEventProc(IntPtr hook, uint eventType, IntPtr hwnd, int objectId, int childId, uint thread, uint time);
+    [DllImport("user32.dll")] internal static extern IntPtr SetWinEventHook(uint min, uint max, IntPtr module,
+        WinEventProc callback, uint process, uint thread, uint flags);
+    [DllImport("user32.dll")] internal static extern bool UnhookWinEvent(IntPtr hook);
     [DllImport("user32.dll")] internal static extern uint MapVirtualKey(uint code, uint mapType);
     [DllImport("user32.dll")] internal static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);

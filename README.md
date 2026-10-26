@@ -4,7 +4,7 @@ Windows 上的 scrcpy 按钮工具栏：返回、桌面、任务、关屏、亮�
 
 ## 先看这里：下载什么，放在哪里
 
-**普通用户请下载 [Releases 最新版本](https://github.com/ssuper1/scrcpy-toolbar/releases/latest) 中的 `scrcpy-toolbar-v0.5.1-windows.zip`，解压后使用。无需编译，也无需安装。** GitHub 自动提供的 `Source code (zip)` / `Source code (tar.gz)` 是源码，不包含编译好的程序。
+**普通用户请下载 [Releases 最新版本](https://github.com/ssuper1/scrcpy-toolbar/releases/latest) 中的 `scrcpy-toolbar-v0.5.2-windows.zip`，解压后使用。无需编译，也无需安装。** GitHub 自动提供的 `Source code (zip)` / `Source code (tar.gz)` 是源码，不包含编译好的程序。
 
 **scrcpy 本身可以放在任意当前用户可写的目录；本工具的 `toolbar` 文件夹必须放在 scrcpy 的目录里面，与 `scrcpy.exe` 相邻。** 不必使用作者电脑上的路径，不建议放在需要管理员权限才能写入的目录。不能单独把工具栏 EXE 移到桌面，也不能在压缩包内直接运行。
 
@@ -64,7 +64,7 @@ D:\Apps\scrcpy\
 2. 点击投屏画面里的手机输入框，直接打字。单按 Shift 切换手机输入法的中英文。
 3. 拼音、候选词和数字选词由手机输入法处理，具体按键需手机输入法支持实体键盘。若 Shift 或数字不符合预期，请检查手机输入法的实体键盘设置。
 
-**电脑显示英文、手机仍输入中文是正常的。** 电脑端的英文布局负责传递拼音字母；最终输入中文还是英文由手机决定。直通功能只向投屏窗口请求英文按键布局，避免 Windows 中文输入法再次截走拼音、Shift 和选词数字，不尝试让两端的中英文图标保持一致。取消勾选会恢复投屏窗口原来的电脑键盘布局。其他电脑应用不应用此设置；运行期间系统的布局列表中可能出现临时 English (US) 键盘布局，不修改默认输入法设置。
+**电脑显示英文、手机仍输入中文是正常的。** 电脑端的英文布局负责传递拼音字母；最终输入中文还是英文由手机决定。直通功能仅在投屏窗口获得焦点时请求英文按键布局，避免 Windows 中文输入法再次截走拼音、Shift 和选词数字。切回电脑输入框、最小化投屏或取消勾选时停止直通并恢复原布局；若电脑输入框继承了投屏的英文布局，会在失焦时按记忆恢复一次，之后保留你在电脑中手动切换的输入法。不尝试让两端的中英文图标保持一致；运行期间系统的布局列表中可能出现临时 English (US) 键盘布局，不修改默认输入法设置。
 
 实体键盘模式仍由手机完成中文转换，不需要另外打开电脑输入窗。若希望先在电脑上编辑整段文字，可使用「备用：电脑输入窗（编辑后粘贴）」：
 
@@ -118,9 +118,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
-输出为 `dist\scrcpy-toolbar-v0.5.1-windows.zip` 和对应 SHA-256 校验文件。发布包通过明确的文件清单构建，不包含本地日志、备份、快捷方式或设备信息。
+输出为 `dist\scrcpy-toolbar-v0.5.2-windows.zip` 和对应 SHA-256 校验文件。发布包通过明确的文件清单构建，不包含本地日志、备份、快捷方式或设备信息。
 
-运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1` 可用不可见的模拟窗口验证投屏窗口英文布局、关闭直通后恢复、快速取消尚未处理的布局请求、进程身份检查、其他前台窗口布局不变，以及键盘模式、参数保留和重连。另覆盖备用输入窗的文本和草稿保护。测试不会连接设备、读写剪贴板或向手机输入内容；实际手机 Shift 切换、数字选词和粘贴效果需要手动验证。
+运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1` 可用不可见的模拟窗口验证后台不启用直通、聚焦启用和失焦恢复、电脑窗口继承英文后的恢复、保留电脑手动切换、快速取消尚未处理的布局请求、进程身份检查，以及键盘模式、参数保留和重连。另覆盖备用输入窗的文本和草稿保护。测试不会连接设备、读写剪贴板或向手机输入内容；实际手机 Shift 切换、数字选词和粘贴效果需要手动验证。
 
 键盘行为以 [scrcpy 3.3.4 官方键盘文档](https://github.com/Genymobile/scrcpy/blob/v3.3.4/doc/keyboard.md) 为准。
 

@@ -49,6 +49,7 @@ internal static class KeyboardRestartTests
             Assert((bool)Get("keyboardModeKnown"), "mode known on new launch");
             Assert(Arguments().Contains("--keyboard=uhid"), "default UHID argument");
             Assert(File.ReadAllText(Path.Combine(testRoot, "keyboard-mode.txt")) == "uhid", "default mode saved");
+            Assert((IntPtr)Get("foregroundHook") != IntPtr.Zero, "foreground event notification registered");
             TestDirectKeyboard(native, otherThread, otherLayout);
 
             Call("ApplyKeyboardMode", "sdk");
@@ -78,7 +79,7 @@ internal static class KeyboardRestartTests
             Call("ReadAttachedCommandLine", "scrcpy.exe --video-bit-rate=35M --max-fps=45 --keyboard=sdk --serial=test-device");
             Assert(Arguments().Contains("--video-bit-rate=35M") && Arguments().Contains("--max-fps=45"), "attached quality retained");
             Assert(Arguments().Contains("--serial=test-device"), "attached device retained");
-            Console.WriteLine("PASS: Mirror-only English layout, original layout restoration, PID guard, unrelated foreground layout unchanged; desktop input draft/composition; UHID/SDK restart and parameter retention.");
+            Console.WriteLine("PASS: Background inactive, focus-only direct input, blur restore, inherited desktop English restored, desktop manual changes retained, rapid focus cancellation, PID guard; keyboard restart and draft protection.");
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
@@ -114,35 +115,68 @@ internal static class KeyboardRestartTests
     {
         object layout = Get("keyboardLayout");
         Type layoutType = layout.GetType();
-        uint mirrorThread = (uint)layoutType.GetField("threadId", Fields).GetValue(layout);
-        IntPtr original = (IntPtr)layoutType.GetField("original", Fields).GetValue(layout);
+        // Stop normal polling; pass simulated foreground handles to the same
+        // controller used by real foreground notifications. No focus stealing.
+        ((System.Windows.Forms.Timer)Get("follow")).Stop();
+        IntPtr target = (IntPtr)Get("target");
+        uint pid = (uint)((Process)Get("mirror")).Id;
+        object[] targetArgs = new object[] { target, 0u };
+        uint mirrorThread = (uint)native.GetMethod("GetWindowThreadProcessId", Fields).Invoke(null, targetArgs);
         MethodInfo getLayout = native.GetMethod("GetKeyboardLayout", Fields);
         Func<IntPtr> current = delegate { return (IntPtr)getLayout.Invoke(null, new object[] { mirrorThread }); };
-        PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
-        Assert((IntPtr)getLayout.Invoke(null, new object[] { otherThread }) == otherLayout, "other app keyboard layout unchanged after enabling direct input");
+        IntPtr original = current();
+        Assert((IntPtr)layoutType.GetField("window", Fields).GetValue(layout) == IntPtr.Zero, "background mirror does not enable direct input");
+        MethodInfo update = layoutType.GetMethod("UpdateForForeground", Fields);
+        Action<IntPtr, bool> focus = delegate(IntPtr foreground, bool enabled) {
+            update.Invoke(layout, new object[] { target, pid, enabled, foreground });
+        };
+        using (Form desktop = new Form())
+        {
+            IntPtr desktopHandle = desktop.Handle;
+            focus(desktopHandle, true);
+            focus(target, true);
+            PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+            Assert((IntPtr)getLayout.Invoke(null, new object[] { otherThread }) == otherLayout, "other app keyboard layout unchanged after enabling direct input");
 
-        Set("directShift", false);
-        Call("UpdateDirectKeyboard");
-        PumpUntil(delegate { return current() == original; });
-        Assert((IntPtr)getLayout.Invoke(null, new object[] { otherThread }) == otherLayout, "other app keyboard layout unchanged after restoration");
-        layoutType.GetMethod("Update", Fields).Invoke(layout,
-            new object[] { Get("target"), (uint)((Process)Get("mirror")).Id + 1u, true });
-        Application.DoEvents();
-        Assert(current() == original, "wrong process identity cannot change layout");
-        layoutType.GetField("lastRequest", Fields).SetValue(layout, DateTime.MinValue);
-        Set("directShift", true);
-        Call("UpdateDirectKeyboard");
-        Set("directShift", false);
-        Call("UpdateDirectKeyboard");
-        // A fake-mirror acknowledgement fences all preceding posted layout
-        // messages, including an enable that was cancelled before processing.
-        string fence = Path.Combine((string)Get("root"), "layout-fence.txt");
-        native.GetMethod("PostMessage", Fields).Invoke(null, new object[] { Get("target"), 0x8001u, IntPtr.Zero, IntPtr.Zero });
-        PumpUntil(delegate { return File.Exists(fence); });
-        Assert(current() == original, "rapid disable restores layout after pending enable");
-        Set("directShift", true);
-        Call("UpdateDirectKeyboard");
-        PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+            focus(desktopHandle, true);
+            PumpUntil(delegate { return current() == original; });
+            Assert(!(bool)layoutType.GetField("focused", Fields).GetValue(layout), "blur stops direct input while setting remains enabled");
+            Assert((IntPtr)getLayout.Invoke(null, new object[] { otherThread }) == otherLayout, "other app keyboard layout unchanged after restoration");
+            update.Invoke(layout, new object[] { target, pid + 1u, true, target });
+            Application.DoEvents();
+            Assert(current() == original, "wrong process identity cannot change layout");
+            focus(target, true);
+            focus(desktopHandle, true);
+            // A fake-mirror acknowledgement fences all preceding posted layout
+            // messages, including an enable that was cancelled before processing.
+            string fence = Path.Combine((string)Get("root"), "layout-fence.txt");
+            native.GetMethod("PostMessage", Fields).Invoke(null, new object[] { Get("target"), 0x8001u, IntPtr.Zero, IntPtr.Zero });
+            PumpUntil(delegate { return File.Exists(fence); });
+            Assert(current() == original, "rapid blur restores layout after pending enable");
+            focus(target, true);
+            PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+            // Model Windows carrying the English layout to a desktop input field.
+            object[] desktopArgs = new object[] { desktopHandle, 0u };
+            uint desktopThread = (uint)native.GetMethod("GetWindowThreadProcessId", Fields).Invoke(null, desktopArgs);
+            native.GetMethod("PostMessage", Fields).Invoke(null,
+            new object[] { desktopHandle, 0x0050u, IntPtr.Zero, new IntPtr(0x04090409) });
+            PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == new IntPtr(0x04090409); });
+            focus(desktopHandle, true);
+            PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == otherLayout; });
+            PumpUntil(delegate { return current() == original; });
+            focus(desktopHandle, true);
+            // Manual desktop input-method changes must remain under user control.
+            native.GetMethod("PostMessage", Fields).Invoke(null,
+            new object[] { desktopHandle, 0x0050u, IntPtr.Zero, new IntPtr(0x04090409) });
+            PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == new IntPtr(0x04090409); });
+            focus(desktopHandle, true);
+            Assert((IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == new IntPtr(0x04090409), "desktop mode is not continuously overwritten");
+            native.GetMethod("PostMessage", Fields).Invoke(null,
+            new object[] { desktopHandle, 0x0050u, IntPtr.Zero, otherLayout });
+            PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == otherLayout; });
+            focus(desktopHandle, true);
+        }
+        ((System.Windows.Forms.Timer)Get("follow")).Start();
     }
     private static void TestDesktopInput(Assembly assembly)
     {
