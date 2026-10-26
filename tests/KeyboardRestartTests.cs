@@ -79,7 +79,7 @@ internal static class KeyboardRestartTests
             Call("ReadAttachedCommandLine", "scrcpy.exe --video-bit-rate=35M --max-fps=45 --keyboard=sdk --serial=test-device");
             Assert(Arguments().Contains("--video-bit-rate=35M") && Arguments().Contains("--max-fps=45"), "attached quality retained");
             Assert(Arguments().Contains("--serial=test-device"), "attached device retained");
-            Console.WriteLine("PASS: Chinese IME open/conversion restore with unchanged layout, verified retry, intentional English retained, one-time recovery, focus/blur layout policy, keyboard restart and draft protection.");
+            Console.WriteLine("PASS: startup mirror exclusion, null/menu focus hops, layout request retries, failed restore snapshot protection, Chinese IME open/conversion restore, intentional English retained, one-time recovery, keyboard restart and draft protection.");
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
@@ -136,6 +136,23 @@ internal static class KeyboardRestartTests
         {
             PumpUntil(delegate { desktop.Refresh(); return desktop.MainWindowHandle != IntPtr.Zero; });
             IntPtr desktopHandle = desktop.MainWindowHandle;
+            IntPtr desktopLayout = (IntPtr)native.GetMethod("ChineseKeyboardLayout", Fields).Invoke(null, null);
+            Assert(desktopLayout != IntPtr.Zero, "Chinese input method available for isolated regression windows");
+            object[] desktopArgs = new object[] { desktopHandle, 0u };
+            uint desktopThread = (uint)native.GetMethod("GetWindowThreadProcessId", Fields).Invoke(null, desktopArgs);
+            Action<IntPtr> setDesktopLayout = delegate(IntPtr value) {
+                native.GetMethod("PostMessage", Fields).Invoke(null,
+                    new object[] { desktopHandle, 0x0050u, IntPtr.Zero, value });
+                PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == value; });
+            };
+            setDesktopLayout(desktopLayout);
+            Action settleDesktop = delegate {
+                PumpUntil(delegate {
+                    focus(desktopHandle, true);
+                    return (IntPtr)layoutType.GetField("pendingDesktop", Fields).GetValue(layout) == IntPtr.Zero &&
+                        !(bool)layoutType.GetField("desktopRestoreDue", Fields).GetValue(layout);
+                });
+            };
             bool imeOpen = true;
             int conversion = 1, ignoredWrites = 0, writes = 0;
             layoutType.GetField("readImeOpen", Fields).SetValue(layout, new Func<IntPtr, bool?>(delegate(IntPtr hwnd) { return imeOpen; }));
@@ -177,15 +194,14 @@ internal static class KeyboardRestartTests
             focus(target, true);
             PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
             // Model Windows carrying the English layout to a desktop input field.
-            object[] desktopArgs = new object[] { desktopHandle, 0u };
-            uint desktopThread = (uint)native.GetMethod("GetWindowThreadProcessId", Fields).Invoke(null, desktopArgs);
             native.GetMethod("PostMessage", Fields).Invoke(null,
             new object[] { desktopHandle, 0x0050u, IntPtr.Zero, new IntPtr(0x04090409) });
             PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == new IntPtr(0x04090409); });
             focus(desktopHandle, true);
-            PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == otherLayout; });
+            PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == desktopLayout; });
             PumpUntil(delegate { return current() == original; });
             focus(desktopHandle, true);
+            settleDesktop();
             // Manual desktop input-method changes must remain under user control.
             native.GetMethod("PostMessage", Fields).Invoke(null,
             new object[] { desktopHandle, 0x0050u, IntPtr.Zero, new IntPtr(0x04090409) });
@@ -193,8 +209,8 @@ internal static class KeyboardRestartTests
             focus(desktopHandle, true);
             Assert((IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == new IntPtr(0x04090409), "desktop mode is not continuously overwritten");
             native.GetMethod("PostMessage", Fields).Invoke(null,
-            new object[] { desktopHandle, 0x0050u, IntPtr.Zero, otherLayout });
-            PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == otherLayout; });
+            new object[] { desktopHandle, 0x0050u, IntPtr.Zero, desktopLayout });
+            PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == desktopLayout; });
             focus(desktopHandle, true);
             imeOpen = false;
             conversion = 0;
@@ -207,10 +223,99 @@ internal static class KeyboardRestartTests
             layoutType.GetMethod("RequestChineseRecovery", Fields).Invoke(layout, null);
             focus(desktopHandle, true);
             Assert(imeOpen && (conversion & 1) != 0, "explicit recovery repairs a baseline already stuck in English");
+            settleDesktop();
             imeOpen = false;
             conversion = 0;
             focus(desktopHandle, true);
             Assert(!imeOpen && conversion == 0, "one-time recovery does not pin desktop to Chinese");
+
+            // A real launch while the existing mirror is foreground must not
+            // snapshot the mirror's English HKL as desktop input, even before
+            // its main window has been discovered.
+            object fresh = Activator.CreateInstance(layoutType, true);
+            update.Invoke(fresh, new object[] { IntPtr.Zero, 0u, false, target });
+            update.Invoke(fresh, new object[] { IntPtr.Zero, pid, false, target });
+            Assert(layoutType.GetField("lastDesktopState", Fields).GetValue(fresh) == null,
+                "startup does not remember undiscovered mirror as desktop");
+            ((IDisposable)fresh).Dispose();
+
+            // Recovering through a null foreground and toolbar-owned menu must
+            // preserve the outstanding desktop restoration until a real app.
+            imeOpen = true; conversion = 1;
+            setDesktopLayout(desktopLayout);
+            focus(desktopHandle, true);
+            focus(target, true);
+            PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+            setDesktopLayout(new IntPtr(0x04090409));
+            focus(IntPtr.Zero, true);
+            focus(toolbar.Handle, true);
+            focus(desktopHandle, true);
+            PumpUntil(delegate {
+                focus(desktopHandle, true);
+                return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == desktopLayout;
+            });
+            settleDesktop();
+            Assert(!(bool)layoutType.GetField("desktopRestoreDue", Fields).GetValue(layout),
+                "desktop restored after null and toolbar foreground hops");
+
+            // A posted request can be ignored by an app. Retry the actual
+            // layout change, rather than waiting only for IME open status.
+            int layoutRequests = 0;
+            var requestField = layoutType.GetField("requestDesktopLayout", Fields);
+            object nativeRequest = requestField.GetValue(layout);
+            requestField.SetValue(layout, new Action<IntPtr, IntPtr>(delegate(IntPtr hwnd, IntPtr value) {
+                layoutRequests++;
+                if (layoutRequests > 2) native.GetMethod("RequestKeyboardLayout", Fields).Invoke(null, new object[] { hwnd, value });
+            }));
+            focus(target, true);
+            PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+            setDesktopLayout(new IntPtr(0x04090409));
+            focus(desktopHandle, true);
+            focus(desktopHandle, true);
+            Assert((IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == new IntPtr(0x04090409), "ignored requests do not count as successful restoration");
+            PumpUntil(delegate {
+                focus(desktopHandle, true);
+                return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == desktopLayout;
+            });
+            settleDesktop();
+            Assert(layoutRequests >= 3, "layout request retried until accepted");
+
+            // A timeout must never replace the saved Chinese baseline with
+            // inherited English, or the next focus cycle cannot recover.
+            requestField.SetValue(layout, new Action<IntPtr, IntPtr>(delegate { }));
+            focus(target, true);
+            PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+            setDesktopLayout(new IntPtr(0x04090409));
+            focus(desktopHandle, true);
+            layoutType.GetField("pendingDesktopDeadline", Fields).SetValue(layout, DateTime.UtcNow.AddSeconds(-1));
+            focus(desktopHandle, true);
+            object baseline = layoutType.GetField("lastDesktopState", Fields).GetValue(layout);
+            Assert((IntPtr)baseline.GetType().GetField("Layout", Fields).GetValue(baseline) == desktopLayout,
+                "failed restore does not overwrite baseline with English");
+            requestField.SetValue(layout, nativeRequest);
+            focus(target, true);
+            focus(desktopHandle, true);
+            PumpUntil(delegate {
+                focus(desktopHandle, true);
+                return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == desktopLayout;
+            });
+            settleDesktop();
+            Assert(layoutType.GetProperty("Error", Fields | BindingFlags.Public).GetValue(layout, null) == null,
+                "next focus cycle automatically retries failed restore");
+
+            // Real desktop activation can report Chinese first, then inherit
+            // English after the editor receives focus. Do not accept the first
+            // matching read and let that delayed state poison the baseline.
+            focus(target, true);
+            PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+            focus(desktopHandle, true);
+            Assert((IntPtr)layoutType.GetField("pendingDesktop", Fields).GetValue(layout) == desktopHandle,
+                "first matching layout read does not finish restoration");
+            setDesktopLayout(new IntPtr(0x04090409));
+            focus(desktopHandle, true);
+            settleDesktop();
+            Assert((IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == desktopLayout,
+                "delayed inherited English repaired before baseline is accepted");
         }
         finally { if (!desktop.HasExited) { desktop.Kill(); desktop.WaitForExit(3000); } desktop.Dispose(); }
         ((System.Windows.Forms.Timer)Get("follow")).Start();

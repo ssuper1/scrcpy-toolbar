@@ -15,6 +15,8 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        InputTrace.Enabled = Array.IndexOf(args, "--diagnose-input") >= 0 ||
+            File.Exists(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "input-diagnostics.flag"));
         bool first;
         using (var mutex = new Mutex(true, "Local\\ScrcpySideToolbar-v1", out first))
         {
@@ -263,8 +265,8 @@ internal sealed class Toolbar : Form
                 catch (InvalidOperationException) { }
             };
             foregroundHook = Native.SetWinEventHook(3, 3, IntPtr.Zero, foregroundChanged, 0, 0, 0);
-            UpdateDirectKeyboard();
-            StartMirror(); follow.Start();
+            StartMirror();
+            UpdateDirectKeyboard(); follow.Start();
         };
         FormClosed += delegate {
             closing = true;
@@ -816,7 +818,9 @@ internal sealed class MirrorKeyboardLayout : IDisposable
     private uint processId, threadId;
     private bool loadedEnglish, requested, restoreQueued;
     private bool focused;
+    private bool desktopRestoreDue;
     private IntPtr pendingDesktop;
+    private uint pendingDesktopPid, pendingDesktopThread;
     private bool recoverChinese;
     private DesktopLayout lastDesktopState, pendingDesktopState;
     private int pendingAttempts;
@@ -824,10 +828,23 @@ internal sealed class MirrorKeyboardLayout : IDisposable
     private readonly Func<IntPtr, int?> readImeConversion = Native.ReadImeConversion;
     private readonly Func<IntPtr, bool, bool> writeImeOpen = Native.WriteImeOpen;
     private readonly Func<IntPtr, int, bool> writeImeConversion = Native.WriteImeConversion;
+    private readonly Action<IntPtr, IntPtr> requestDesktopLayout = Native.RequestKeyboardLayout;
     private DateTime pendingDesktopDeadline;
+    private DateTime pendingDesktopVerifiedAt;
     private readonly Dictionary<IntPtr, DesktopLayout> desktopLayouts = new Dictionary<IntPtr, DesktopLayout>();
     private DateTime lastRequest, firstRequest;
     internal string Error { get; private set; }
+
+    private readonly DesktopLayout startupDesktopState = DefaultDesktopState();
+
+    private static DesktopLayout DefaultDesktopState()
+    {
+        IntPtr layout = Native.DefaultKeyboardLayout();
+        if (layout == IntPtr.Zero) return null;
+        bool chinese = (layout.ToInt64() & 0x3FF) == 4;
+        return new DesktopLayout { Layout = layout,
+            ImeOpen = chinese ? (bool?)true : null, Conversion = chinese ? (int?)1 : null };
+    }
 
     internal void RequestChineseRecovery() { recoverChinese = true; }
 
@@ -840,6 +857,19 @@ internal sealed class MirrorKeyboardLayout : IDisposable
     // isolated invisible windows, without changing the user's actual focus.
     internal void UpdateForForeground(IntPtr target, uint expectedPid, bool enabled, IntPtr foreground)
     {
+        if (InputTrace.Enabled)
+        {
+            uint foregroundPid;
+            uint foregroundThread = Native.GetWindowThreadProcessId(foreground, out foregroundPid);
+            uint inputThread = Native.InputThread(foreground);
+            InputTrace.Record("foreground=" + foreground.ToInt64().ToString("X") + " pid=" + foregroundPid +
+                " layout=" + Native.GetKeyboardLayout(foregroundThread).ToInt64().ToString("X") +
+                " inputThread=" + inputThread + " inputLayout=" + Native.GetKeyboardLayout(inputThread).ToInt64().ToString("X") +
+                " mirror=" + target.ToInt64().ToString("X") + " enabled=" + enabled + " focused=" + focused +
+                " baseline=" + (lastDesktopState == null ? "none" : lastDesktopState.Layout.ToInt64().ToString("X")) +
+                " default=" + (startupDesktopState == null ? "none" : startupDesktopState.Layout.ToInt64().ToString("X")) +
+                " pending=" + pendingDesktop.ToInt64().ToString("X") + " error=" + Error);
+        }
         uint actualPid = 0;
         uint actualThread = target == IntPtr.Zero ? 0 : Native.GetWindowThreadProcessId(target, out actualPid);
         bool active = enabled && expectedPid != 0 && actualPid == expectedPid && actualThread != 0 &&
@@ -847,17 +877,24 @@ internal sealed class MirrorKeyboardLayout : IDisposable
         if (!active)
         {
             Restore();
-            if (focused && foreground != target) RestoreDesktop(foreground);
+            if (focused) desktopRestoreDue = true;
             focused = false;
-            if (recoverChinese && foreground != target) BeginChineseRecovery(foreground);
+            // During startup target may not yet be known. Never save scrcpy's
+            // direct-English layout as a desktop app's original input method.
+            // Keep the restore obligation through taskbar/menu/null focus hops.
+            if (expectedPid == 0 || foreground == target ||
+                !Native.IsDesktopInputWindow(foreground, expectedPid, OwnPid)) return;
+            if (recoverChinese) BeginChineseRecovery(foreground);
+            else if (desktopRestoreDue && pendingDesktop != foreground) RestoreDesktop(foreground);
             CompleteDesktopRestore(foreground);
-            if (foreground != target) RememberDesktop(foreground);
+            RememberDesktop(foreground);
             return;
         }
         // A focus session always starts a new request interval; never delay the
         // first keystrokes because of a rate limit from the previous session.
         if (!focused) { lastRequest = DateTime.MinValue; firstRequest = DateTime.MinValue; }
         focused = true;
+        pendingDesktop = IntPtr.Zero;
         if (window != target || processId != expectedPid || threadId != actualThread)
         {
             IntPtr priorOriginal = processId == expectedPid && threadId == actualThread ? original : IntPtr.Zero;
@@ -913,57 +950,83 @@ internal sealed class MirrorKeyboardLayout : IDisposable
     private void RestoreDesktop(IntPtr foreground)
     {
         uint pid;
-        uint tid = Native.GetWindowThreadProcessId(foreground, out pid);
+        Native.GetWindowThreadProcessId(foreground, out pid);
+        uint tid = Native.InputThread(foreground);
         if (tid == 0) return;
         IntPtr current = Native.GetKeyboardLayout(tid);
         DesktopLayout saved;
         DesktopLayout desired = desktopLayouts.TryGetValue(foreground, out saved) && saved.ProcessId == pid && saved.ThreadId == tid
-            ? saved : lastDesktopState;
+            ? saved : lastDesktopState ?? startupDesktopState;
         if (desired == null && original != IntPtr.Zero) desired = new DesktopLayout { Layout = original };
         if (desired == null || desired.Layout == IntPtr.Zero) return;
         // Windows can carry the mirror's English layout into the newly focused
         // app when per-window input methods are disabled. Restore only this
         // inherited layout, once on blur; leave a different app layout alone.
-        if (current == english && desired.Layout != english)
-            Native.PostMessage(foreground, 0x0050, IntPtr.Zero, desired.Layout);
         // Even when HKL is already Chinese, its IME may still be closed/in
         // English conversion mode. Layout equality does not mean restoration.
-        if (current != english && current != desired.Layout) return;
+        if (current != english && current != desired.Layout)
+        { desktopRestoreDue = false; pendingDesktop = IntPtr.Zero; return; }
         pendingDesktop = foreground;
+        pendingDesktopPid = pid;
+        pendingDesktopThread = tid;
         pendingDesktopState = desired;
         pendingAttempts = 0;
-        pendingDesktopDeadline = DateTime.UtcNow.AddMilliseconds(800);
+        pendingDesktopVerifiedAt = DateTime.MinValue;
+        pendingDesktopDeadline = DateTime.UtcNow.AddSeconds(2);
     }
 
     private void CompleteDesktopRestore(IntPtr foreground)
     {
         if (pendingDesktop == IntPtr.Zero) return;
-        if (foreground != pendingDesktop) { pendingDesktop = IntPtr.Zero; return; }
-        if (DateTime.UtcNow > pendingDesktopDeadline || pendingAttempts >= 4)
+        if (foreground != pendingDesktop) return;
+        if (DateTime.UtcNow > pendingDesktopDeadline || pendingAttempts >= 12)
         {
             Error = "电脑输入法尚未恢复。可点“恢复电脑中文输入”，再切回电脑输入框重试。";
-            pendingDesktop = IntPtr.Zero;
+            // Preserve the snapshot after failure. Recording the inherited
+            // English state here would make all future restores choose English.
             return;
         }
         uint pid;
-        uint tid = Native.GetWindowThreadProcessId(foreground, out pid);
-        if (tid == 0) { pendingDesktop = IntPtr.Zero; return; }
+        Native.GetWindowThreadProcessId(foreground, out pid);
+        uint tid = Native.InputThread(foreground);
+        if (tid == 0 || pid != pendingDesktopPid || tid != pendingDesktopThread)
+        { pendingDesktop = IntPtr.Zero; return; }
         DesktopLayout desired = pendingDesktopState;
-        if (Native.GetKeyboardLayout(tid) != desired.Layout) return;
-        pendingAttempts++;
-        if (desired.Conversion.HasValue && readImeConversion(foreground) != desired.Conversion)
-            writeImeConversion(foreground, desired.Conversion.Value);
-        if (desired.ImeOpen.HasValue && readImeOpen(foreground) != desired.ImeOpen)
-            writeImeOpen(foreground, desired.ImeOpen.Value);
+        if (Native.GetKeyboardLayout(tid) != desired.Layout)
+        {
+            pendingAttempts++;
+            pendingDesktopVerifiedAt = DateTime.MinValue;
+            // Some app frames ignore a request sent to their top-level window.
+            // Address the focused input control, retry, and verify its thread.
+            requestDesktopLayout(foreground, desired.Layout);
+            return;
+        }
+        bool needsConversion = desired.Conversion.HasValue && readImeConversion(foreground) != desired.Conversion;
+        bool needsOpen = desired.ImeOpen.HasValue && readImeOpen(foreground) != desired.ImeOpen;
+        if (needsConversion || needsOpen)
+        {
+            pendingAttempts++;
+            pendingDesktopVerifiedAt = DateTime.MinValue;
+            if (needsConversion) writeImeConversion(foreground, desired.Conversion.Value);
+            if (needsOpen) writeImeOpen(foreground, desired.ImeOpen.Value);
+        }
         if ((!desired.ImeOpen.HasValue || readImeOpen(foreground) == desired.ImeOpen) &&
             (!desired.Conversion.HasValue || readImeConversion(foreground) == desired.Conversion))
-        { pendingDesktop = IntPtr.Zero; Error = null; }
+        {
+            // Foreground activation can initially expose the frame's Chinese
+            // thread, then switch focus to an editor thread still using English.
+            // Require a short stable interval before accepting the new baseline.
+            if (pendingDesktopVerifiedAt == DateTime.MinValue) pendingDesktopVerifiedAt = DateTime.UtcNow;
+            if ((DateTime.UtcNow - pendingDesktopVerifiedAt).TotalMilliseconds < 400) return;
+            pendingDesktop = IntPtr.Zero; desktopRestoreDue = false; Error = null;
+        }
     }
 
     private void BeginChineseRecovery(IntPtr foreground)
     {
         uint pid;
-        uint tid = Native.GetWindowThreadProcessId(foreground, out pid);
+        Native.GetWindowThreadProcessId(foreground, out pid);
+        uint tid = Native.InputThread(foreground);
         if (tid == 0 || pid == OwnPid) return;
         IntPtr chinese = Native.ChineseKeyboardLayout();
         if (chinese == IntPtr.Zero) return;
@@ -972,18 +1035,23 @@ internal sealed class MirrorKeyboardLayout : IDisposable
         desktopLayouts[foreground] = desired;
         lastDesktopState = desired;
         if (Native.GetKeyboardLayout(tid) != chinese)
-            Native.PostMessage(foreground, 0x0050, IntPtr.Zero, chinese);
+            requestDesktopLayout(foreground, chinese);
         pendingDesktop = foreground;
+        pendingDesktopPid = pid;
+        pendingDesktopThread = tid;
+        desktopRestoreDue = true;
         pendingDesktopState = desired;
         pendingDesktopDeadline = DateTime.UtcNow.AddSeconds(2);
         pendingAttempts = 0;
+        pendingDesktopVerifiedAt = DateTime.MinValue;
         recoverChinese = false;
     }
 
     private void RememberDesktop(IntPtr foreground)
     {
         uint pid;
-        uint tid = Native.GetWindowThreadProcessId(foreground, out pid);
+        Native.GetWindowThreadProcessId(foreground, out pid);
+        uint tid = Native.InputThread(foreground);
         if (tid == 0) return;
         // Context menus in our non-activating toolbar can become foreground
         // with IME disabled. They must not replace the desktop typing baseline.
@@ -993,7 +1061,7 @@ internal sealed class MirrorKeyboardLayout : IDisposable
         // Do not record the inherited English layout while an asynchronous
         // restoration is still queued. Once restored, normal manual changes
         // in desktop apps become the baseline for the next focus session.
-        if (pendingDesktop == foreground) return;
+        if (pendingDesktop == foreground || desktopRestoreDue) return;
         if (desktopLayouts.Count > 128) desktopLayouts.Clear();
         desktopLayouts[foreground] = new DesktopLayout { ProcessId = pid, ThreadId = tid, Layout = current,
             ImeOpen = readImeOpen(foreground), Conversion = readImeConversion(foreground) };
@@ -1018,10 +1086,11 @@ internal sealed class MirrorKeyboardLayout : IDisposable
     public void Dispose()
     {
         Restore();
-        if (focused)
+        if (focused || desktopRestoreDue)
         {
             IntPtr foreground = Native.GetForegroundWindow();
-            if (foreground != window) RestoreDesktop(foreground);
+            if (foreground != window && Native.IsDesktopInputWindow(foreground, processId, OwnPid))
+            { RestoreDesktop(foreground); CompleteDesktopRestore(foreground); }
             focused = false;
         }
         if (!loadedEnglish || english == IntPtr.Zero) return;
@@ -1032,6 +1101,25 @@ internal sealed class MirrorKeyboardLayout : IDisposable
         if (threadId == 0 || Native.GetKeyboardLayout(threadId) != english)
             Native.UnloadKeyboardLayout(english);
         english = IntPtr.Zero;
+    }
+}
+
+internal static class InputTrace
+{
+    internal static bool Enabled;
+    private static string previous;
+    internal static void Record(string state)
+    {
+        if (!Enabled || state == previous) return;
+        previous = state;
+        try
+        {
+            string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "input-state.log");
+            if (File.Exists(path) && new FileInfo(path).Length > 256 * 1024) File.WriteAllText(path, "");
+            File.AppendAllText(path, DateTime.Now.ToString("HH:mm:ss.fff ") + state + Environment.NewLine);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 }
 
@@ -1127,6 +1215,65 @@ internal sealed class DesktopInputForm : Form
 
 internal static class Native
 {
+    internal static IntPtr DefaultKeyboardLayout()
+    {
+        IntPtr preferred;
+        return SystemParametersInfo(0x0059, 0, out preferred, 0) ? preferred : IntPtr.Zero;
+    }
+
+    internal static bool IsDesktopInputWindow(IntPtr window, uint mirrorPid, uint ownPid)
+    {
+        uint pid;
+        if (window == IntPtr.Zero || GetWindowThreadProcessId(window, out pid) == 0 ||
+            pid == mirrorPid) return false;
+        if (pid == ownPid)
+        {
+            // The optional desktop text editor is a real typing surface;
+            // toolbar buttons and menus must still be skipped as focus hops.
+            IntPtr input = FocusedInputWindow(window);
+            var inputClass = new StringBuilder(128);
+            GetClassName(input, inputClass, inputClass.Capacity);
+            return input != window && inputClass.ToString().StartsWith("WindowsForms10.EDIT", StringComparison.Ordinal);
+        }
+        var name = new StringBuilder(128);
+        GetClassName(window, name, name.Capacity);
+        switch (name.ToString())
+        {
+            case "Shell_TrayWnd": case "Shell_SecondaryTrayWnd": case "Progman":
+            case "WorkerW": case "#32768": case "MultitaskingViewFrame":
+            case "TaskSwitcherWnd": return false;
+        }
+        return true;
+    }
+
+    internal static IntPtr FocusedInputWindow(IntPtr window)
+    {
+        uint pid;
+        uint tid = GetWindowThreadProcessId(window, out pid);
+        if (tid == 0) return IntPtr.Zero;
+        var info = new GuiThreadInfo { Size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
+        uint focusPid;
+        return GetGUIThreadInfo(tid, ref info) && info.Focus != IntPtr.Zero &&
+            GetWindowThreadProcessId(info.Focus, out focusPid) != 0 && focusPid == pid ? info.Focus : window;
+    }
+
+    internal static uint InputThread(IntPtr window)
+    {
+        uint pid;
+        return GetWindowThreadProcessId(FocusedInputWindow(window), out pid);
+    }
+
+    internal static void RequestKeyboardLayout(IntPtr window, IntPtr layout)
+    {
+        IntPtr input = FocusedInputWindow(window);
+        if (input == IntPtr.Zero) return;
+        PostMessage(input, 0x0050, IntPtr.Zero, layout);
+        if (input != window) PostMessage(window, 0x0050, IntPtr.Zero, layout);
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hwnd, StringBuilder name, int count);
+
     internal static IntPtr ChineseKeyboardLayout()
     {
         IntPtr preferred;
@@ -1141,11 +1288,8 @@ internal static class Native
     { public uint Size, Flags; public IntPtr Active, Focus, Capture, Menu, Move, Caret; public Rect CaretRect; }
     private static IntPtr FocusedIme(IntPtr window)
     {
-        uint pid;
-        uint tid = GetWindowThreadProcessId(window, out pid);
-        if (tid == 0) return IntPtr.Zero;
-        var info = new GuiThreadInfo { Size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
-        IntPtr focus = GetGUIThreadInfo(tid, ref info) && info.Focus != IntPtr.Zero ? info.Focus : window;
+        IntPtr focus = FocusedInputWindow(window);
+        if (focus == IntPtr.Zero) return IntPtr.Zero;
         return ImmGetDefaultIMEWnd(focus);
     }
     private static bool ImeControl(IntPtr window, int command, int value, out UIntPtr result)
