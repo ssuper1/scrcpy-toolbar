@@ -13,7 +13,7 @@ using System.Windows.Forms;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         bool first;
         using (var mutex = new Mutex(true, "Local\\ScrcpySideToolbar-v1", out first))
@@ -21,7 +21,11 @@ internal static class Program
             if (!first) return;
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            try { Application.Run(new Toolbar()); }
+            try {
+                var toolbar = new Toolbar();
+                if (Array.IndexOf(args, "--recover-desktop-chinese") >= 0) toolbar.RequestDesktopChineseRecovery();
+                Application.Run(toolbar);
+            }
             catch (Exception ex)
             {
                 MessageBox.Show("工具栏启动失败：\n" + ex.Message, "scrcpy 工具栏",
@@ -195,6 +199,9 @@ internal sealed class Toolbar : Form
         ToolStripMenuItem keyboardSettings = new ToolStripMenuItem("打开手机的实体键盘设置");
         keyboardSettings.Click += delegate { SendShortcut(0x4B, false); };
         keyboardMenu.Items.Add(keyboardSettings);
+        ToolStripMenuItem recoverDesktop = new ToolStripMenuItem("恢复电脑中文输入（点击后切回电脑输入框）");
+        recoverDesktop.Click += delegate { keyboardLayout.RequestChineseRecovery(); };
+        keyboardMenu.Items.Add(recoverDesktop);
         ToolStripMenuItem desktopTyping = new ToolStripMenuItem("备用：电脑输入窗（编辑后粘贴）");
         desktopTyping.Click += delegate { OpenDesktopInput(); };
         keyboardMenu.Items.Add(desktopTyping);
@@ -435,11 +442,13 @@ internal sealed class Toolbar : Form
             ready && !restarting && !exitRequested && directShift && keyboardModeKnown && keyboardMode == "uhid");
         if (keyboardLayout.Error != null)
         {
-            status.Text = "键盘未直通";
+            status.Text = "输入法需重试";
             tips.SetToolTip(keyboardButton, keyboardLayout.Error);
         }
-        else if (status.Text == "键盘未直通") { status.Text = "已连接"; UpdateKeyboardTip(); }
+        else if (status.Text == "输入法需重试") { status.Text = "已连接"; UpdateKeyboardTip(); }
     }
+
+    internal void RequestDesktopChineseRecovery() { keyboardLayout.RequestChineseRecovery(); }
 
     private void OpenDesktopInput()
     {
@@ -802,15 +811,25 @@ internal sealed class Toolbar : Form
 // consuming them as a separate composition. UHID already forwards those events.
 internal sealed class MirrorKeyboardLayout : IDisposable
 {
+    private static readonly uint OwnPid = (uint)Process.GetCurrentProcess().Id;
     private IntPtr window, original, english;
     private uint processId, threadId;
     private bool loadedEnglish, requested, restoreQueued;
     private bool focused;
-    private IntPtr desktopLayout, pendingDesktop;
+    private IntPtr pendingDesktop;
+    private bool recoverChinese;
+    private DesktopLayout lastDesktopState, pendingDesktopState;
+    private int pendingAttempts;
+    private readonly Func<IntPtr, bool?> readImeOpen = Native.ReadImeOpen;
+    private readonly Func<IntPtr, int?> readImeConversion = Native.ReadImeConversion;
+    private readonly Func<IntPtr, bool, bool> writeImeOpen = Native.WriteImeOpen;
+    private readonly Func<IntPtr, int, bool> writeImeConversion = Native.WriteImeConversion;
     private DateTime pendingDesktopDeadline;
     private readonly Dictionary<IntPtr, DesktopLayout> desktopLayouts = new Dictionary<IntPtr, DesktopLayout>();
     private DateTime lastRequest, firstRequest;
     internal string Error { get; private set; }
+
+    internal void RequestChineseRecovery() { recoverChinese = true; }
 
     internal void Update(IntPtr target, uint expectedPid, bool enabled)
     {
@@ -830,6 +849,8 @@ internal sealed class MirrorKeyboardLayout : IDisposable
             Restore();
             if (focused && foreground != target) RestoreDesktop(foreground);
             focused = false;
+            if (recoverChinese && foreground != target) BeginChineseRecovery(foreground);
+            CompleteDesktopRestore(foreground);
             if (foreground != target) RememberDesktop(foreground);
             return;
         }
@@ -885,6 +906,8 @@ internal sealed class MirrorKeyboardLayout : IDisposable
     {
         internal uint ProcessId, ThreadId;
         internal IntPtr Layout;
+        internal bool? ImeOpen;
+        internal int? Conversion;
     }
 
     private void RestoreDesktop(IntPtr foreground)
@@ -894,17 +917,67 @@ internal sealed class MirrorKeyboardLayout : IDisposable
         if (tid == 0) return;
         IntPtr current = Native.GetKeyboardLayout(tid);
         DesktopLayout saved;
-        IntPtr desired = desktopLayouts.TryGetValue(foreground, out saved) && saved.ProcessId == pid && saved.ThreadId == tid
-            ? saved.Layout : (desktopLayout != IntPtr.Zero ? desktopLayout : original);
+        DesktopLayout desired = desktopLayouts.TryGetValue(foreground, out saved) && saved.ProcessId == pid && saved.ThreadId == tid
+            ? saved : lastDesktopState;
+        if (desired == null && original != IntPtr.Zero) desired = new DesktopLayout { Layout = original };
+        if (desired == null || desired.Layout == IntPtr.Zero) return;
         // Windows can carry the mirror's English layout into the newly focused
         // app when per-window input methods are disabled. Restore only this
         // inherited layout, once on blur; leave a different app layout alone.
-        if (current != english || desired == IntPtr.Zero || desired == english) return;
-        if (Native.PostMessage(foreground, 0x0050, IntPtr.Zero, desired))
+        if (current == english && desired.Layout != english)
+            Native.PostMessage(foreground, 0x0050, IntPtr.Zero, desired.Layout);
+        // Even when HKL is already Chinese, its IME may still be closed/in
+        // English conversion mode. Layout equality does not mean restoration.
+        if (current != english && current != desired.Layout) return;
+        pendingDesktop = foreground;
+        pendingDesktopState = desired;
+        pendingAttempts = 0;
+        pendingDesktopDeadline = DateTime.UtcNow.AddMilliseconds(800);
+    }
+
+    private void CompleteDesktopRestore(IntPtr foreground)
+    {
+        if (pendingDesktop == IntPtr.Zero) return;
+        if (foreground != pendingDesktop) { pendingDesktop = IntPtr.Zero; return; }
+        if (DateTime.UtcNow > pendingDesktopDeadline || pendingAttempts >= 4)
         {
-            pendingDesktop = foreground;
-            pendingDesktopDeadline = DateTime.UtcNow.AddSeconds(2);
+            Error = "电脑输入法尚未恢复。可点“恢复电脑中文输入”，再切回电脑输入框重试。";
+            pendingDesktop = IntPtr.Zero;
+            return;
         }
+        uint pid;
+        uint tid = Native.GetWindowThreadProcessId(foreground, out pid);
+        if (tid == 0) { pendingDesktop = IntPtr.Zero; return; }
+        DesktopLayout desired = pendingDesktopState;
+        if (Native.GetKeyboardLayout(tid) != desired.Layout) return;
+        pendingAttempts++;
+        if (desired.Conversion.HasValue && readImeConversion(foreground) != desired.Conversion)
+            writeImeConversion(foreground, desired.Conversion.Value);
+        if (desired.ImeOpen.HasValue && readImeOpen(foreground) != desired.ImeOpen)
+            writeImeOpen(foreground, desired.ImeOpen.Value);
+        if ((!desired.ImeOpen.HasValue || readImeOpen(foreground) == desired.ImeOpen) &&
+            (!desired.Conversion.HasValue || readImeConversion(foreground) == desired.Conversion))
+        { pendingDesktop = IntPtr.Zero; Error = null; }
+    }
+
+    private void BeginChineseRecovery(IntPtr foreground)
+    {
+        uint pid;
+        uint tid = Native.GetWindowThreadProcessId(foreground, out pid);
+        if (tid == 0 || pid == OwnPid) return;
+        IntPtr chinese = Native.ChineseKeyboardLayout();
+        if (chinese == IntPtr.Zero) return;
+        var desired = new DesktopLayout { ProcessId = pid, ThreadId = tid, Layout = chinese,
+            ImeOpen = true, Conversion = (readImeConversion(foreground) ?? 0) | 1 };
+        desktopLayouts[foreground] = desired;
+        lastDesktopState = desired;
+        if (Native.GetKeyboardLayout(tid) != chinese)
+            Native.PostMessage(foreground, 0x0050, IntPtr.Zero, chinese);
+        pendingDesktop = foreground;
+        pendingDesktopState = desired;
+        pendingDesktopDeadline = DateTime.UtcNow.AddSeconds(2);
+        pendingAttempts = 0;
+        recoverChinese = false;
     }
 
     private void RememberDesktop(IntPtr foreground)
@@ -912,19 +985,19 @@ internal sealed class MirrorKeyboardLayout : IDisposable
         uint pid;
         uint tid = Native.GetWindowThreadProcessId(foreground, out pid);
         if (tid == 0) return;
+        // Context menus in our non-activating toolbar can become foreground
+        // with IME disabled. They must not replace the desktop typing baseline.
+        if (pid == OwnPid) return;
         IntPtr current = Native.GetKeyboardLayout(tid);
         if (current == IntPtr.Zero) return;
         // Do not record the inherited English layout while an asynchronous
         // restoration is still queued. Once restored, normal manual changes
         // in desktop apps become the baseline for the next focus session.
-        if (pendingDesktop == foreground)
-        {
-            if (current == english && DateTime.UtcNow < pendingDesktopDeadline) return;
-            pendingDesktop = IntPtr.Zero;
-        }
+        if (pendingDesktop == foreground) return;
         if (desktopLayouts.Count > 128) desktopLayouts.Clear();
-        desktopLayouts[foreground] = new DesktopLayout { ProcessId = pid, ThreadId = tid, Layout = current };
-        desktopLayout = current;
+        desktopLayouts[foreground] = new DesktopLayout { ProcessId = pid, ThreadId = tid, Layout = current,
+            ImeOpen = readImeOpen(foreground), Conversion = readImeConversion(foreground) };
+        lastDesktopState = desktopLayouts[foreground];
     }
 
     private void Restore()
@@ -1054,6 +1127,46 @@ internal sealed class DesktopInputForm : Form
 
 internal static class Native
 {
+    internal static IntPtr ChineseKeyboardLayout()
+    {
+        IntPtr preferred;
+        if (SystemParametersInfo(0x0059, 0, out preferred, 0) && (preferred.ToInt64() & 0x3FF) == 4) return preferred;
+        IntPtr[] layouts = new IntPtr[GetKeyboardLayoutList(0, null)];
+        GetKeyboardLayoutList(layouts.Length, layouts);
+        foreach (IntPtr layout in layouts) if ((layout.ToInt64() & 0x3FF) == 4) return layout;
+        return IntPtr.Zero;
+    }
+    [DllImport("user32.dll")] private static extern bool SystemParametersInfo(uint action, uint parameter, out IntPtr result, uint flags);
+    [StructLayout(LayoutKind.Sequential)] internal struct GuiThreadInfo
+    { public uint Size, Flags; public IntPtr Active, Focus, Capture, Menu, Move, Caret; public Rect CaretRect; }
+    private static IntPtr FocusedIme(IntPtr window)
+    {
+        uint pid;
+        uint tid = GetWindowThreadProcessId(window, out pid);
+        if (tid == 0) return IntPtr.Zero;
+        var info = new GuiThreadInfo { Size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
+        IntPtr focus = GetGUIThreadInfo(tid, ref info) && info.Focus != IntPtr.Zero ? info.Focus : window;
+        return ImmGetDefaultIMEWnd(focus);
+    }
+    private static bool ImeControl(IntPtr window, int command, int value, out UIntPtr result)
+    {
+        result = UIntPtr.Zero;
+        IntPtr ime = FocusedIme(window);
+        return ime != IntPtr.Zero && SendMessageTimeout(ime, 0x0283, new IntPtr(command), new IntPtr(value),
+            0x0002, 60, out result) != IntPtr.Zero;
+    }
+    internal static bool? ReadImeOpen(IntPtr window)
+    { UIntPtr value; return ImeControl(window, 5, 0, out value) ? (bool?)(value != UIntPtr.Zero) : null; }
+    internal static int? ReadImeConversion(IntPtr window)
+    { UIntPtr value; return ImeControl(window, 1, 0, out value) ? (int?)value.ToUInt64() : null; }
+    internal static bool WriteImeOpen(IntPtr window, bool open)
+    { UIntPtr value; return ImeControl(window, 6, open ? 1 : 0, out value); }
+    internal static bool WriteImeConversion(IntPtr window, int conversion)
+    { UIntPtr value; return ImeControl(window, 2, conversion, out value); }
+    [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
+    [DllImport("imm32.dll")] private static extern IntPtr ImmGetDefaultIMEWnd(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam,
+        IntPtr lParam, uint flags, uint timeout, out UIntPtr result);
     [StructLayout(LayoutKind.Sequential)] internal struct Rect { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] internal struct KeyboardInput
     { public ushort Vk, Scan; public uint Flags, Time; public UIntPtr ExtraInfo; }

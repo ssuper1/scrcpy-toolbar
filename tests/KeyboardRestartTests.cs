@@ -79,7 +79,7 @@ internal static class KeyboardRestartTests
             Call("ReadAttachedCommandLine", "scrcpy.exe --video-bit-rate=35M --max-fps=45 --keyboard=sdk --serial=test-device");
             Assert(Arguments().Contains("--video-bit-rate=35M") && Arguments().Contains("--max-fps=45"), "attached quality retained");
             Assert(Arguments().Contains("--serial=test-device"), "attached device retained");
-            Console.WriteLine("PASS: Background inactive, focus-only direct input, blur restore, inherited desktop English restored, desktop manual changes retained, rapid focus cancellation, PID guard; keyboard restart and draft protection.");
+            Console.WriteLine("PASS: Chinese IME open/conversion restore with unchanged layout, verified retry, intentional English retained, one-time recovery, focus/blur layout policy, keyboard restart and draft protection.");
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
@@ -130,15 +130,36 @@ internal static class KeyboardRestartTests
         Action<IntPtr, bool> focus = delegate(IntPtr foreground, bool enabled) {
             update.Invoke(layout, new object[] { target, pid, enabled, foreground });
         };
-        using (Form desktop = new Form())
+        Process desktop = Process.Start(new ProcessStartInfo(Path.Combine((string)Get("root"), "scrcpy.exe"), "--test-desktop") {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true });
+        try
         {
-            IntPtr desktopHandle = desktop.Handle;
+            PumpUntil(delegate { desktop.Refresh(); return desktop.MainWindowHandle != IntPtr.Zero; });
+            IntPtr desktopHandle = desktop.MainWindowHandle;
+            bool imeOpen = true;
+            int conversion = 1, ignoredWrites = 0, writes = 0;
+            layoutType.GetField("readImeOpen", Fields).SetValue(layout, new Func<IntPtr, bool?>(delegate(IntPtr hwnd) { return imeOpen; }));
+            layoutType.GetField("readImeConversion", Fields).SetValue(layout, new Func<IntPtr, int?>(delegate(IntPtr hwnd) { return conversion; }));
+            layoutType.GetField("writeImeOpen", Fields).SetValue(layout, new Func<IntPtr, bool, bool>(delegate(IntPtr hwnd, bool value) {
+                writes++;
+                if (ignoredWrites > 0) ignoredWrites--; else imeOpen = value;
+                return true;
+            }));
+            layoutType.GetField("writeImeConversion", Fields).SetValue(layout, new Func<IntPtr, int, bool>(delegate(IntPtr hwnd, int value) { conversion = value; return true; }));
             focus(desktopHandle, true);
             focus(target, true);
             PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
             Assert((IntPtr)getLayout.Invoke(null, new object[] { otherThread }) == otherLayout, "other app keyboard layout unchanged after enabling direct input");
 
+            // Regression: Chinese HKL can be unchanged while its IME is closed
+            // and converting to English. Restore both, not just the layout.
+            imeOpen = false;
+            conversion = 0;
+            ignoredWrites = 1;
             focus(desktopHandle, true);
+            Assert(!imeOpen, "message success alone does not count as IME restoration");
+            focus(desktopHandle, true);
+            Assert(imeOpen && conversion == 1 && writes >= 2, "closed Chinese IME restored and verified even when HKL already matches");
             PumpUntil(delegate { return current() == original; });
             Assert(!(bool)layoutType.GetField("focused", Fields).GetValue(layout), "blur stops direct input while setting remains enabled");
             Assert((IntPtr)getLayout.Invoke(null, new object[] { otherThread }) == otherLayout, "other app keyboard layout unchanged after restoration");
@@ -175,7 +196,23 @@ internal static class KeyboardRestartTests
             new object[] { desktopHandle, 0x0050u, IntPtr.Zero, otherLayout });
             PumpUntil(delegate { return (IntPtr)getLayout.Invoke(null, new object[] { desktopThread }) == otherLayout; });
             focus(desktopHandle, true);
+            imeOpen = false;
+            conversion = 0;
+            focus(desktopHandle, true);
+            focus(target, true);
+            PumpUntil(delegate { return current() == new IntPtr(0x04090409); });
+            focus(desktopHandle, true);
+            Assert(!imeOpen && conversion == 0, "intentional desktop English mode is preserved on later switches");
+            PumpUntil(delegate { return current() == original; });
+            layoutType.GetMethod("RequestChineseRecovery", Fields).Invoke(layout, null);
+            focus(desktopHandle, true);
+            Assert(imeOpen && (conversion & 1) != 0, "explicit recovery repairs a baseline already stuck in English");
+            imeOpen = false;
+            conversion = 0;
+            focus(desktopHandle, true);
+            Assert(!imeOpen && conversion == 0, "one-time recovery does not pin desktop to Chinese");
         }
+        finally { if (!desktop.HasExited) { desktop.Kill(); desktop.WaitForExit(3000); } desktop.Dispose(); }
         ((System.Windows.Forms.Timer)Get("follow")).Start();
     }
     private static void TestDesktopInput(Assembly assembly)
