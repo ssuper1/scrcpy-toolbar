@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Management;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -58,6 +60,7 @@ internal sealed class Toolbar : Form
     private readonly List<Button> actions = new List<Button>();
     private Button fullscreenButton;
     private Button qualityButton;
+    private Button keyboardButton;
     private Button foldButton;
     private Label heading;
     private int expandedHeight;
@@ -73,11 +76,29 @@ internal sealed class Toolbar : Form
     private bool restarting, mirrorQualityKnown;
     private QualityPreset quality = QualityPresets[2];
     private ContextMenuStrip qualityMenu;
+    private ContextMenuStrip keyboardMenu;
+    private string keyboardMode = "uhid";
+    private bool keyboardModeKnown;
+    private readonly string settingsPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "ScrcpyToolbar", "keyboard-mode.txt");
+    private readonly Stopwatch restartWait = new Stopwatch();
+    private QualityPreset previousQuality;
+    private string previousKeyboardMode;
+    private string restartWindowArguments = "";
+    private string deviceSerial;
     private float scale;
     private string logPath;
 
     public Toolbar()
     {
+        try
+        {
+            string saved = File.ReadAllText(settingsPath).Trim();
+            if (saved == "uhid" || saved == "sdk") keyboardMode = saved;
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
         using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) scale = g.DpiX / 96f;
         Text = "scrcpy 侧边工具栏";
         FormBorderStyle = FormBorderStyle.None;
@@ -138,6 +159,29 @@ internal sealed class Toolbar : Form
         AddAction("旋转", "旋转设备屏幕 · Alt+R", 0x52, false, ref y);
         AddAction("通知", "展开通知栏 · Alt+N", 0x4E, false, ref y);
         AddAction("粘贴", "粘贴电脑剪贴板中的文字 · Alt+V", 0x56, false, ref y);
+        keyboardButton = MakeButton("电脑键盘", new Rectangle(7, y, 74, 32));
+        keyboardButton.Click += delegate { ShowKeyboardMenu(); };
+        actions.Add(keyboardButton);
+        y += 36;
+        keyboardMenu = new ContextMenuStrip();
+        AddKeyboardMode("实体键盘（推荐，手机输入法处理中文）", "uhid");
+        AddKeyboardMode("兼容模式（英文 / 数字，中文用粘贴）", "sdk");
+        keyboardMenu.Items.Add(new ToolStripSeparator());
+        ToolStripMenuItem keyboardSettings = new ToolStripMenuItem("打开手机的实体键盘设置");
+        keyboardSettings.Click += delegate { SendShortcut(0x4B, false); };
+        keyboardMenu.Items.Add(keyboardSettings);
+        ToolStripMenuItem keyboardHelp = new ToolStripMenuItem("怎么输入中文？");
+        keyboardHelp.Click += delegate {
+            MessageBox.Show("1. 选择“实体键盘”，等待投屏重新连接。\n" +
+                "2. 在投屏里点击手机的输入框，再用电脑键盘打字。\n" +
+                "3. 中文由手机输入法处理；电脑输入法先切到英文状态。\n" +
+                "4. 首次使用可打开实体键盘设置，配置布局和支持实体键盘的中文输入法。\n\n" +
+                "若手机输入法不支持，可在电脑上输入中文并复制，再点工具栏“粘贴”。\n" +
+                "键盘只在投屏窗口获得焦点时输入，切回电脑应用后正常操作电脑。",
+                "电脑键盘输入", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        };
+        keyboardMenu.Items.Add(keyboardHelp);
+        UpdateKeyboardTip();
 
         y += 4;
         Button exit = MakeButton("退出投屏", new Rectangle(7, y, 74, 32));
@@ -176,7 +220,10 @@ internal sealed class Toolbar : Form
         follow.Interval = 120;
         follow.Tick += Poll;
         Shown += delegate { StartMirror(); follow.Start(); };
-        FormClosed += delegate { closing = true; follow.Stop(); follow.Dispose(); qualityMenu.Dispose(); tips.Dispose(); };
+        FormClosed += delegate {
+            closing = true; follow.Stop(); follow.Dispose(); qualityMenu.Dispose();
+            keyboardMenu.Dispose(); tips.Dispose();
+        };
     }
 
     protected override bool ShowWithoutActivation { get { return true; } }
@@ -282,7 +329,7 @@ internal sealed class Toolbar : Form
         foreach (ToolStripMenuItem item in qualityMenu.Items)
         {
             QualityPreset preset = (QualityPreset)item.Tag;
-            item.Checked = preset.BitRate == quality.BitRate && preset.MaxFps == quality.MaxFps;
+            item.Checked = mirrorQualityKnown && preset.BitRate == quality.BitRate && preset.MaxFps == quality.MaxFps;
         }
         qualityMenu.Show(qualityButton, new Point(qualityButton.Width, 0));
     }
@@ -296,20 +343,85 @@ internal sealed class Toolbar : Form
                 this, S(5), Height - S(20), 2200);
             return;
         }
+        RestartMirror(selected, keyboardMode, "正在切换画质");
+    }
+
+    private void AddKeyboardMode(string label, string mode)
+    {
+        ToolStripMenuItem item = new ToolStripMenuItem(label);
+        item.Tag = mode;
+        item.Click += delegate { keyboardMenu.Close(); ApplyKeyboardMode(mode); };
+        keyboardMenu.Items.Add(item);
+    }
+
+    private void ShowKeyboardMenu()
+    {
+        if (!ready || restarting || exitRequested) return;
+        foreach (ToolStripItem item in keyboardMenu.Items)
+        {
+            ToolStripMenuItem modeItem = item as ToolStripMenuItem;
+            if (modeItem != null && modeItem.Tag is string)
+                modeItem.Checked = keyboardModeKnown && (string)modeItem.Tag == keyboardMode;
+        }
+        keyboardMenu.Show(keyboardButton, new Point(keyboardButton.Width, 0));
+    }
+
+    private void ApplyKeyboardMode(string mode)
+    {
+        if (mode != "uhid" && mode != "sdk") return;
+        if (!ready || restarting || exitRequested) return;
+        if (keyboardModeKnown && keyboardMode == mode)
+        {
+            tips.Show("当前模式已启用，请点击手机输入框后打字。", this, S(5), Height - S(20), 2800);
+            return;
+        }
+        RestartMirror(quality, mode, "正在切换键盘");
+    }
+
+    private void UpdateKeyboardTip()
+    {
+        tips.SetToolTip(keyboardButton, keyboardModeKnown
+            ? (keyboardMode == "uhid" ? "实体键盘：点击手机输入框后打字，中文由手机输入法处理"
+                : "兼容键盘：直接输入英文和数字，中文可用粘贴")
+            : "已有投屏的键盘模式未知；点击选择模式，重连后生效");
+    }
+
+    private void RestartMirror(QualityPreset selectedQuality, string selectedKeyboard, string message)
+    {
+        if (!ready || restarting || exitRequested || mirror == null || !Native.IsWindow(target)) return;
         uint pid;
         Native.GetWindowThreadProcessId(target, out pid);
         if (pid != (uint)mirror.Id) return;
-        quality = selected;
+        previousQuality = quality;
+        previousKeyboardMode = keyboardMode;
+        quality = selectedQuality;
+        keyboardMode = selectedKeyboard;
+        restartWindowArguments = "";
+        Native.Rect rect;
+        if (fullscreen) restartWindowArguments = " --fullscreen";
+        else if (Native.GetWindowRect(target, out rect))
+            restartWindowArguments = " --window-x=" + rect.Left + " --window-y=" + rect.Top;
         restarting = true;
-        exitRequested = false;
-        status.Text = "正在切换画质";
+        restartWait.Restart();
+        status.Text = message;
         foreach (Button b in actions) b.Enabled = false;
-        if (!Native.PostMessage(target, 0x0010, IntPtr.Zero, IntPtr.Zero))
-        {
-            restarting = false;
-            foreach (Button b in actions) b.Enabled = true;
-            tips.Show("切换画质失败，请先关闭投屏后重新启动。", this, S(5), Height - S(20), 2800);
-        }
+        // Windows destroys owned windows with their owner. Detach BEFORE closing
+        // scrcpy so this toolbar survives long enough to start the replacement.
+        SetFullscreenLayer(false);
+        Native.SetOwner(Handle, IntPtr.Zero);
+        if (!Native.PostMessage(target, 0x0010, IntPtr.Zero, IntPtr.Zero)) CancelRestart();
+    }
+
+    private void CancelRestart()
+    {
+        restarting = false;
+        restartWait.Stop();
+        quality = previousQuality;
+        keyboardMode = previousKeyboardMode;
+        if (Native.IsWindow(target)) Native.SetOwner(Handle, target);
+        status.Text = "已连接";
+        foreach (Button b in actions) b.Enabled = true;
+        tips.Show("投屏未能关闭，设置尚未应用，请稍后重试。", this, S(5), Height - S(20), 3000);
     }
 
     private void StartMirror()
@@ -328,19 +440,65 @@ internal sealed class Toolbar : Form
             catch { }
             p.Dispose();
         }
-        if (mirror != null) return;
+        if (mirror != null)
+        {
+            ReadAttachedOptions();
+            UpdateKeyboardTip();
+            return;
+        }
 
         LaunchMirror();
+    }
+
+    private void ReadAttachedOptions()
+    {
+        // Best effort: an attached mirror may have been started with different
+        // quality/device options. Only carry validated argument values forward.
+        try
+        {
+            using (var search = new ManagementObjectSearcher(
+                "SELECT CommandLine FROM Win32_Process WHERE ProcessId=" + mirror.Id))
+            {
+                search.Options.Timeout = TimeSpan.FromSeconds(2);
+                using (ManagementObjectCollection rows = search.Get())
+                    foreach (ManagementObject row in rows)
+                        using (row)
+                            ReadAttachedCommandLine(row["CommandLine"] as string ?? "");
+            }
+        }
+        catch (ManagementException) { }
+        catch (UnauthorizedAccessException) { }
+        catch (System.Runtime.InteropServices.COMException) { }
+    }
+
+    private void ReadAttachedCommandLine(string commandLine)
+    {
+        Match bitrate = Regex.Match(commandLine, @"(?:^|\s)--video-bit-rate[=\s]+(\d+[KMG]?)(?=\s|$)", RegexOptions.IgnoreCase);
+        Match fps = Regex.Match(commandLine, @"(?:^|\s)--max-fps[=\s]+(\d+)(?=\s|$)");
+        if (bitrate.Success && fps.Success)
+        {
+            quality = new QualityPreset("当前画质", bitrate.Groups[1].Value, fps.Groups[1].Value);
+            mirrorQualityKnown = true;
+        }
+        Match keyboard = Regex.Match(commandLine, @"(?:^|\s)--keyboard[=\s]+(uhid|sdk)(?=\s|$)");
+        if (keyboard.Success)
+        {
+            keyboardMode = keyboard.Groups[1].Value;
+            keyboardModeKnown = true;
+        }
+        Match serial = Regex.Match(commandLine, @"(?:^|\s)--serial[=\s]+([A-Za-z0-9_.:\[\]-]+)(?=\s|$)");
+        if (serial.Success) deviceSerial = serial.Groups[1].Value;
     }
 
     private void LaunchMirror()
     {
         string exe = Path.Combine(root, "scrcpy.exe");
         logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "scrcpy.log");
-        File.WriteAllText(logPath, "scrcpy 工具栏启动日志 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + Environment.NewLine, Encoding.UTF8);
-        var info = new ProcessStartInfo(exe,
-            "--shortcut-mod=lalt --stay-awake --video-bit-rate=" + quality.BitRate +
-            " --max-fps=" + quality.MaxFps) {
+        string arguments = BuildMirrorArguments();
+        lock (logLock) recentLog.Clear();
+        File.WriteAllText(logPath, "scrcpy 工具栏启动日志 " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
+            Environment.NewLine + "启动参数：" + arguments + Environment.NewLine, Encoding.UTF8);
+        var info = new ProcessStartInfo(exe, arguments) {
             WorkingDirectory = root, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardOutput = true, RedirectStandardError = true
         };
@@ -352,6 +510,15 @@ internal sealed class Toolbar : Form
         mirror.BeginOutputReadLine();
         mirror.BeginErrorReadLine();
         mirrorQualityKnown = true;
+        keyboardModeKnown = true;
+        UpdateKeyboardTip();
+    }
+
+    private string BuildMirrorArguments()
+    {
+        return "--shortcut-mod=lalt --stay-awake --video-bit-rate=" + quality.BitRate +
+            " --max-fps=" + quality.MaxFps + " --keyboard=" + keyboardMode +
+            (string.IsNullOrEmpty(deviceSerial) ? "" : " --serial=" + deviceSerial) + restartWindowArguments;
     }
     private void LogLine(object sender, DataReceivedEventArgs e)
     {
@@ -373,6 +540,7 @@ internal sealed class Toolbar : Form
             {
                 if (restarting)
                 {
+                    mirror.WaitForExit(1000);
                     mirror.Dispose();
                     mirror = null;
                     target = IntPtr.Zero;
@@ -380,12 +548,18 @@ internal sealed class Toolbar : Form
                     exitRequested = false;
                     startup.Restart();
                     restarting = false;
+                    restartWait.Stop();
                     LaunchMirror();
                     return;
                 }
                 follow.Stop();
                 if (!ready) ShowStartupError();
                 Close(); return;
+            }
+            if (restarting)
+            {
+                if (restartWait.Elapsed.TotalSeconds > 8) CancelRestart();
+                return;
             }
             IntPtr hwnd = mirror.MainWindowHandle;
             if (hwnd == IntPtr.Zero)
@@ -408,6 +582,16 @@ internal sealed class Toolbar : Form
                 ready = true;
                 foreach (Button b in actions) b.Enabled = true;
                 status.Text = "已连接";
+                if (keyboardModeKnown)
+                {
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(settingsPath));
+                        File.WriteAllText(settingsPath, keyboardMode, Encoding.UTF8);
+                    }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
             }
             if (Native.IsIconic(target) || !Native.IsWindowVisible(target))
             {
@@ -439,7 +623,8 @@ internal sealed class Toolbar : Form
             rect.Left <= bounds.Left + 2 && rect.Top <= bounds.Top + 2 &&
             rect.Right >= bounds.Right - 2 && rect.Bottom >= bounds.Bottom - 2;
         if (fullscreen != wasFullscreen) SetCollapsed(fullscreen);
-        if (fullscreen && !collapsed && !dragging && !Bounds.Contains(Cursor.Position) &&
+        if (fullscreen && !collapsed && !dragging && !qualityMenu.Visible && !keyboardMenu.Visible &&
+            !Bounds.Contains(Cursor.Position) &&
             (DateTime.UtcNow - lastInteraction).TotalSeconds >= 3) SetCollapsed(true);
         fullscreenButton.Text = fullscreen ? "退出全屏" : "全屏";
         // SDL may raise its fullscreen window above an ordinary owned window.
@@ -475,6 +660,7 @@ internal sealed class Toolbar : Form
     }
     private void ExitMirror()
     {
+        if (restarting) return;
         if (exitRequested) return;
         if (mirror == null || !ready) { Close(); return; }
         uint pid;

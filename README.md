@@ -1,10 +1,10 @@
 # scrcpy 侧边工具栏
 
-Windows 上的 scrcpy 按钮工具栏：返回、桌面、任务、关屏、亮屏、音量、全屏、旋转、通知、粘贴和退出投屏。
+Windows 上的 scrcpy 按钮工具栏：返回、桌面、任务、关屏、亮屏、音量、画质、全屏、旋转、通知、电脑键盘、粘贴和退出投屏。
 
 ## 先看这里：下载什么，放在哪里
 
-**普通用户请下载 [Releases 最新版本](https://github.com/ssuper1/scrcpy-toolbar/releases/latest) 中的 `scrcpy-toolbar-v0.3.0-windows.zip`，解压后使用。无需编译，也无需安装。** GitHub 自动提供的 `Source code (zip)` / `Source code (tar.gz)` 是源码，不包含编译好的程序。
+**普通用户请下载 [Releases 最新版本](https://github.com/ssuper1/scrcpy-toolbar/releases/latest) 中的 `scrcpy-toolbar-v0.4.0-windows.zip`，解压后使用。无需编译，也无需安装。** GitHub 自动提供的 `Source code (zip)` / `Source code (tar.gz)` 是源码，不包含编译好的程序。
 
 **scrcpy 本身可以放在任意当前用户可写的目录；本工具的 `toolbar` 文件夹必须放在 scrcpy 的目录里面，与 `scrcpy.exe` 相邻。** 不必使用作者电脑上的路径，不建议放在需要管理员权限才能写入的目录。不能单独把工具栏 EXE 移到桌面，也不能在压缩包内直接运行。
 
@@ -43,6 +43,8 @@ D:\Apps\scrcpy\
 | 返回 / 桌面 / 任务 | 操作设备的返回、主屏幕、最近任务 |
 | 关屏 / 亮屏 | 关闭或点亮设备的实体显示屏，电脑继续投屏 |
 | 音量 + / − | 调整 Android 设备的音量 |
+| 画质 | 切换视频码率和帧率，自动重启投屏应用 |
+| 电脑键盘 | 切换实体 / 兼容键盘模式，打开手机的实体键盘设置 |
 | 全屏 / 退出全屏 | 切换电脑投屏窗口的全屏状态 |
 | 旋转 / 通知 / 粘贴 | 旋转设备画面、展开通知栏、粘贴电脑文字 |
 | 顶部「工具」 | 按住拖动工具栏，避开画面内容 |
@@ -54,14 +56,26 @@ D:\Apps\scrcpy\
 
 全屏下需要用键盘退出时，先点击投屏画面，按 `Alt+F` 退出全屏，或按 `Alt+F4` 关闭投屏。
 
+## 用电脑键盘输入手机文字
+
+1. 点击工具栏「电脑键盘 → 实体键盘（推荐）」。若附加的是已有投屏，会自动重连一次，应用键盘模式。
+2. 在电脑的投屏画面里点击手机输入框，然后用电脑键盘打字。键盘只在投屏窗口获得焦点时输入手机。
+3. **中文由手机输入法处理。** 将电脑输入法切到英文状态，在手机端选择支持实体键盘的中文输入法，输入拼音并选词。支持情况取决于手机输入法。
+4. 首次使用可通过「电脑键盘 → 打开手机的实体键盘设置」配置键盘布局，通常选 English (US) / QWERTY。
+
+如果设备不支持实体键盘模式，选择「兼容模式」输入英文和数字。中文也可以在电脑其他窗口输入、复制，然后点击手机输入框，再点工具栏「粘贴」。部分应用可能限制粘贴。
+
+新投屏默认启用实体键盘（`--keyboard=uhid`）。成功连接后会在 `%LOCALAPPDATA%\ScrcpyToolbar\keyboard-mode.txt` 保存选择，下次启动沿用。切换键盘会暂时重连，保留当前画质；切换画质也会保留键盘模式。附加已有投屏时会尽量读取明确的启动参数，否则将键盘模式标记为未知，选择一次后再应用。
+
 ## 工作方式和限制
 
 - Windows Forms 独立程序，通过窗口跟随和左 Alt 快捷键控制 scrcpy，没有修改 scrcpy 本体。
-- 启动时，如果同目录的 scrcpy 已有投屏窗口，会附加工具栏；否则启动 `scrcpy.exe --shortcut-mod=lalt --stay-awake --video-bit-rate=20M --max-fps=60`。
+- 启动时，如果同目录的 scrcpy 已有投屏窗口，会附加工具栏；否则默认启动 `scrcpy.exe --shortcut-mod=lalt --stay-awake --video-bit-rate=20M --max-fps=60 --keyboard=uhid`。
 - 工具栏启动的默认画质为 20 Mbps、60 FPS，适合高分辨率平板。
 - 「画质」按钮可切换流畅 8M/30 FPS、标准 12M/60 FPS、高清 20M/60 FPS、超清 40M/60 FPS；切换时会自动重启当前投屏。
 - 使用同目录自带的 `adb.exe`，只为子进程设置 ADB 路径，不改系统环境变量。
 - 当前一次管理一个投屏窗口；多个设备时请先让 scrcpy 选定设备并打开投屏，再运行工具栏。
+- 自动重连使用工具栏的参数。若附加的 scrcpy 有自定义设备选择或其他启动参数，请在单设备连接下使用模式切换。
 - 附加已有投屏时，要求它使用左 Alt 快捷键。直接双击 scrcpy 本身不会自动启动工具栏。
 - 需要支持 Windows Forms 的 .NET Framework 4.x；面向 Windows 10 / 11。无需 Python、Node.js 或编译工具。
 - 编译和程序内部检查已通过。实际手机音量、关屏和不同 DPI / 多屏 / 全屏组合仍需要用户手动验证；尚未覆盖所有设备。
@@ -92,7 +106,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
-输出为 `dist\scrcpy-toolbar-v0.3.0-windows.zip` 和对应 SHA-256 校验文件。发布包通过明确的文件清单构建，不包含本地日志、备份、快捷方式或设备信息。
+输出为 `dist\scrcpy-toolbar-v0.4.0-windows.zip` 和对应 SHA-256 校验文件。发布包通过明确的文件清单构建，不包含本地日志、备份、快捷方式或设备信息。
+
+运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1` 可用不可见的模拟窗口验证键盘模式、参数保留和重连，不会连接设备或向手机输入内容。
+
+键盘行为以 [scrcpy 3.3.4 官方键盘文档](https://github.com/Genymobile/scrcpy/blob/v3.3.4/doc/keyboard.md) 为准。
 
 ## 开源许可
 
