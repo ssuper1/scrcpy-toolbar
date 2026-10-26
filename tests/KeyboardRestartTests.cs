@@ -30,6 +30,7 @@ internal static class KeyboardRestartTests
             File.WriteAllText(Path.Combine(testRoot, "adb.exe"), "not executed");
             Assembly assembly = Assembly.LoadFile(Path.GetFullPath(args[0]));
             toolbarType = assembly.GetType("Toolbar");
+            TestDesktopInput(assembly);
             toolbar = (Form)Activator.CreateInstance(toolbarType);
             toolbar.Opacity = 0;
             Set("root", testRoot);
@@ -70,7 +71,7 @@ internal static class KeyboardRestartTests
             Call("ReadAttachedCommandLine", "scrcpy.exe --video-bit-rate=35M --max-fps=45 --keyboard=sdk --serial=test-device");
             Assert(Arguments().Contains("--video-bit-rate=35M") && Arguments().Contains("--max-fps=45"), "attached quality retained");
             Assert(Arguments().Contains("--serial=test-device"), "attached device retained");
-            Console.WriteLine("PASS: UHID/SDK restart, saved mode, quality/device retention, unknown attached mode, toolbar lifetime.");
+            Console.WriteLine("PASS: Desktop input Unicode, draft retention, composition guard, errors, focusable form; UHID/SDK restart, saved mode, quality/device retention, unknown attached mode, toolbar lifetime.");
             return 0;
         }
         catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
@@ -102,6 +103,40 @@ internal static class KeyboardRestartTests
     private static void Set(string field, object value) { toolbarType.GetField(field, Fields).SetValue(toolbar, value); }
     private static object Call(string method, params object[] args) { return toolbarType.GetMethod(method, Fields).Invoke(toolbar, args); }
     private static string Arguments() { return (string)Call("BuildMirrorArguments"); }
+    private static void TestDesktopInput(Assembly assembly)
+    {
+        Type inputType = assembly.GetType("DesktopInputForm");
+        int calls = 0;
+        string received = null;
+        string failure = null;
+        Func<string, string> stub = delegate(string value) { calls++; received = value; return failure; };
+        using (Form input = (Form)Activator.CreateInstance(inputType, Fields | BindingFlags.Public,
+            null, new object[] { stub }, null))
+        {
+            TextBox editor = (TextBox)inputType.GetField("editor", Fields).GetValue(input);
+            Label feedback = (Label)inputType.GetField("feedback", Fields).GetValue(input);
+            MethodInfo request = inputType.GetMethod("RequestFill", Fields);
+            request.Invoke(input, null);
+            Assert(calls == 0, "empty input is not filled");
+            string mixed = "\u4e2d\u6587 English 123\r\n\ud83d\ude00";
+            editor.Text = mixed;
+            PropertyInfo composing = editor.GetType().GetProperty("IsComposing", Fields);
+            composing.GetSetMethod(true).Invoke(editor, new object[] { true });
+            request.Invoke(input, null);
+            Assert(calls == 0 && editor.Text == mixed, "unfinished IME composition is not filled");
+            composing.GetSetMethod(true).Invoke(editor, new object[] { false });
+            request.Invoke(input, null);
+            Assert(calls == 1 && received == mixed && editor.Text == mixed, "Unicode, English, digits, newlines passed unchanged and draft retained");
+            failure = "test paste failure";
+            request.Invoke(input, null);
+            Assert(calls == 2 && feedback.Text == failure && editor.Text == mixed, "paste failure displayed without losing draft");
+            CreateParams cp = (CreateParams)typeof(Control).GetProperty("CreateParams", Fields).GetValue(input, null);
+            Assert((cp.ExStyle & 0x08000000) == 0, "desktop input permits normal activation and Windows IME");
+            IntPtr handle = input.Handle;
+            input.Close();
+            Assert(!input.IsDisposed && editor.Text == mixed, "close hides input and retains draft");
+        }
+    }
     private static void Assert(bool condition, string label) { if (!condition) throw new Exception("FAIL: " + label); }
     private static void PumpUntil(Func<bool> condition)
     {

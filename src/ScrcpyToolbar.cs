@@ -77,6 +77,7 @@ internal sealed class Toolbar : Form
     private QualityPreset quality = QualityPresets[2];
     private ContextMenuStrip qualityMenu;
     private ContextMenuStrip keyboardMenu;
+    private DesktopInputForm desktopInput;
     private string keyboardMode = "uhid";
     private bool keyboardModeKnown;
     private readonly string settingsPath = Path.Combine(
@@ -164,7 +165,11 @@ internal sealed class Toolbar : Form
         actions.Add(keyboardButton);
         y += 36;
         keyboardMenu = new ContextMenuStrip();
-        AddKeyboardMode("实体键盘（推荐，手机输入法处理中文）", "uhid");
+        ToolStripMenuItem desktopTyping = new ToolStripMenuItem("电脑输入（推荐，使用电脑输入法选词）");
+        desktopTyping.Click += delegate { OpenDesktopInput(); };
+        keyboardMenu.Items.Add(desktopTyping);
+        keyboardMenu.Items.Add(new ToolStripSeparator());
+        AddKeyboardMode("手机输入法模式（实体键盘）", "uhid");
         AddKeyboardMode("兼容模式（英文 / 数字，中文用粘贴）", "sdk");
         keyboardMenu.Items.Add(new ToolStripSeparator());
         ToolStripMenuItem keyboardSettings = new ToolStripMenuItem("打开手机的实体键盘设置");
@@ -172,7 +177,10 @@ internal sealed class Toolbar : Form
         keyboardMenu.Items.Add(keyboardSettings);
         ToolStripMenuItem keyboardHelp = new ToolStripMenuItem("怎么输入中文？");
         keyboardHelp.Click += delegate {
-            MessageBox.Show("1. 选择“实体键盘”，等待投屏重新连接。\n" +
+            MessageBox.Show("推荐：选择“电脑输入”，在电脑输入窗内使用 Windows 输入法。\n" +
+                "中英文切换、数字选词都在电脑完成，再点“填入手机”。\n\n" +
+                "直接在投屏中打字则由手机输入法处理：\n" +
+                "1. 选择“手机输入法模式”，等待投屏重新连接。\n" +
                 "2. 在投屏里点击手机的输入框，再用电脑键盘打字。\n" +
                 "3. 中文由手机输入法处理；电脑输入法先切到英文状态。\n" +
                 "4. 首次使用可打开实体键盘设置，配置布局和支持实体键盘的中文输入法。\n\n" +
@@ -223,6 +231,7 @@ internal sealed class Toolbar : Form
         FormClosed += delegate {
             closing = true; follow.Stop(); follow.Dispose(); qualityMenu.Dispose();
             keyboardMenu.Dispose(); tips.Dispose();
+            if (desktopInput != null) desktopInput.Dispose();
         };
     }
 
@@ -380,10 +389,45 @@ internal sealed class Toolbar : Form
 
     private void UpdateKeyboardTip()
     {
-        tips.SetToolTip(keyboardButton, keyboardModeKnown
+        tips.SetToolTip(keyboardButton, "推荐用“电脑输入”在 Windows 中选词后填入手机。\n" + (keyboardModeKnown
             ? (keyboardMode == "uhid" ? "实体键盘：点击手机输入框后打字，中文由手机输入法处理"
                 : "兼容键盘：直接输入英文和数字，中文可用粘贴")
-            : "已有投屏的键盘模式未知；点击选择模式，重连后生效");
+            : "已有投屏的键盘模式未知；点击选择模式，重连后生效"));
+    }
+
+    private void OpenDesktopInput()
+    {
+        if (!ready || restarting || exitRequested) return;
+        if (desktopInput == null || desktopInput.IsDisposed)
+            desktopInput = new DesktopInputForm(FillDesktopText);
+        if (!desktopInput.Visible)
+        {
+            Rectangle work = Screen.FromHandle(target).WorkingArea;
+            desktopInput.Location = new Point(Math.Max(work.Left, work.Right - desktopInput.Width - S(100)),
+                Math.Max(work.Top, work.Bottom - desktopInput.Height - S(30)));
+            desktopInput.Show(this);
+        }
+        desktopInput.Activate();
+        desktopInput.FocusEditor();
+    }
+
+    private string FillDesktopText(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return "请先输入文字。";
+        if (!ready || restarting || exitRequested || mirror == null || !Native.IsWindow(target))
+            return "投屏尚未就绪，文字已保留，请连接后再试。";
+        uint pid;
+        Native.GetWindowThreadProcessId(target, out pid);
+        if (pid != (uint)mirror.Id) return "投屏窗口已变化，请重新连接后再试。";
+        if (Native.IsIconic(target)) Native.ShowWindow(target, 9);
+        Native.SetForegroundWindow(target);
+        if (Native.GetForegroundWindow() != target)
+            return "未能切换到投屏。请先点击手机输入框，再点“填入手机”。";
+        try { Clipboard.SetText(text, TextDataFormat.UnicodeText); }
+        catch (ExternalException) { return "剪贴板正被占用，文字已保留，请稍后再试。"; }
+        // MOD+V synchronizes the Unicode clipboard and injects a paste action.
+        // Do not restore it immediately: scrcpy consumes the shortcut asynchronously.
+        return SendShortcut(0x56, false) ? null : "填入请求未能发出，文字已保留，请重试。";
     }
 
     private void RestartMirror(QualityPreset selectedQuality, string selectedKeyboard, string message)
@@ -624,12 +668,15 @@ internal sealed class Toolbar : Form
             rect.Right >= bounds.Right - 2 && rect.Bottom >= bounds.Bottom - 2;
         if (fullscreen != wasFullscreen) SetCollapsed(fullscreen);
         if (fullscreen && !collapsed && !dragging && !qualityMenu.Visible && !keyboardMenu.Visible &&
+            (desktopInput == null || !desktopInput.Visible) &&
             !Bounds.Contains(Cursor.Position) &&
             (DateTime.UtcNow - lastInteraction).TotalSeconds >= 3) SetCollapsed(true);
         fullscreenButton.Text = fullscreen ? "退出全屏" : "全屏";
         // SDL may raise its fullscreen window above an ordinary owned window.
         // Raise the toolbar without activating it only while this mirror is active.
-        SetFullscreenLayer(fullscreen && Native.GetForegroundWindow() == target);
+        IntPtr foreground = Native.GetForegroundWindow();
+        SetFullscreenLayer(fullscreen && (foreground == target ||
+            (desktopInput != null && desktopInput.Visible && foreground == desktopInput.Handle)));
         Rectangle work = fullscreen ? bounds : screen.WorkingArea;
         if (dragging) return;
         if (fullscreen && fullscreenFloating)
@@ -674,18 +721,18 @@ internal sealed class Toolbar : Form
         }
         else tips.Show("关闭请求未成功，请点击投屏窗口后按 Alt+F4。", this, S(5), Height - S(20), 3000);
     }
-    private void SendShortcut(ushort key, bool shift)
+    private bool SendShortcut(ushort key, bool shift)
     {
-        if (!ready || !Native.IsWindow(target)) return;
+        if (!ready || restarting || exitRequested || !Native.IsWindow(target)) return false;
         uint pid;
         Native.GetWindowThreadProcessId(target, out pid);
-        if (mirror == null || pid != (uint)mirror.Id) return;
+        if (mirror == null || pid != (uint)mirror.Id) return false;
         if (Native.IsIconic(target)) Native.ShowWindow(target, 9);
         Native.SetForegroundWindow(target);
         if (Native.GetForegroundWindow() != target)
         {
             tips.Show("请先点击一下投屏窗口，再试此按钮。", this, S(5), Height - S(20), 2500);
-            return;
+            return false;
         }
         var inputs = new List<Native.Input>();
         inputs.Add(Native.Key(0xA4, false));
@@ -697,6 +744,97 @@ internal sealed class Toolbar : Form
         uint sent = Native.SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(Native.Input)));
         if (sent != inputs.Count)
             tips.Show("按键发送失败，请让投屏和工具栏使用相同权限运行。", this, S(5), Height - S(20), 2500);
+        return sent == inputs.Count;
+    }
+}
+
+internal sealed class CompositionTextBox : TextBox
+{
+    internal bool IsComposing { get; private set; }
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == 0x010D) IsComposing = true; // WM_IME_STARTCOMPOSITION
+        base.WndProc(ref m);
+        if (m.Msg == 0x010E) IsComposing = false; // WM_IME_ENDCOMPOSITION
+    }
+}
+
+internal sealed class DesktopInputForm : Form
+{
+    private readonly CompositionTextBox editor = new CompositionTextBox();
+    private readonly Label feedback = new Label();
+    private readonly Button fill = new Button();
+    private readonly Func<string, string> fillText;
+
+    internal DesktopInputForm(Func<string, string> fillText)
+    {
+        this.fillText = fillText;
+        Text = "电脑输入 · 使用电脑输入法";
+        FormBorderStyle = FormBorderStyle.SizableToolWindow;
+        StartPosition = FormStartPosition.Manual;
+        ShowInTaskbar = false;
+        AutoScaleMode = AutoScaleMode.Dpi;
+        AutoScaleDimensions = new SizeF(96, 96);
+        Font = new Font("Microsoft YaHei UI", 10f);
+        ClientSize = new Size(590, 320);
+        MinimumSize = new Size(420, 260);
+        BackColor = Color.FromArgb(31, 35, 43);
+        ForeColor = Color.WhiteSmoke;
+        Padding = new Padding(12);
+
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4 };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+        layout.Controls.Add(new Label {
+            Text = "先在投屏里点击手机输入框，再在这里打字。\n中英文切换、数字选词使用电脑输入法。",
+            Dock = DockStyle.Fill, AutoSize = false
+        }, 0, 0);
+        editor.Multiline = true;
+        editor.AcceptsReturn = true;
+        editor.ScrollBars = ScrollBars.Vertical;
+        editor.ImeMode = ImeMode.On;
+        editor.Dock = DockStyle.Fill;
+        editor.Font = new Font("Microsoft YaHei UI", 12f);
+        layout.Controls.Add(editor, 0, 1);
+        var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
+        fill.Text = "填入手机";
+        fill.AutoSize = true;
+        fill.Height = 34;
+        fill.ForeColor = Color.Black;
+        fill.Click += delegate { RequestFill(); };
+        buttons.Controls.Add(fill);
+        buttons.Controls.Add(new Label { Text = "Enter 换行；选词完成后点击填入", AutoSize = true, Padding = new Padding(8, 8, 0, 0) });
+        layout.Controls.Add(buttons, 0, 2);
+        feedback.Text = "填入时会使用剪贴板，不模拟回车。草稿仅在本次运行中保留。";
+        feedback.Dock = DockStyle.Fill;
+        feedback.ForeColor = Color.LightSteelBlue;
+        layout.Controls.Add(feedback, 0, 3);
+        Controls.Add(layout);
+        FormClosing += delegate(object sender, FormClosingEventArgs e) {
+            if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }
+        };
+    }
+
+    internal void FocusEditor() { editor.Focus(); }
+
+    private void RequestFill()
+    {
+        if (editor.IsComposing)
+        {
+            feedback.Text = "请先完成候选词选择，再点“填入手机”。";
+            return;
+        }
+        if (editor.TextLength == 0) { feedback.Text = "请先输入文字。"; return; }
+        fill.Enabled = false;
+        try
+        {
+            string error = fillText(editor.Text);
+            feedback.Text = error ?? "已发出填入请求，请查看手机。草稿保留；再次填入会重复插入。";
+        }
+        finally { fill.Enabled = true; }
     }
 }
 
