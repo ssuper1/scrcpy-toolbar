@@ -50,6 +50,10 @@ internal static class KeyboardRestartTests
             Assert(Arguments().Contains("--keyboard=uhid"), "default UHID argument");
             Assert(File.ReadAllText(Path.Combine(testRoot, "keyboard-mode.txt")) == "uhid", "default mode saved");
             Assert((IntPtr)Get("foregroundHook") != IntPtr.Zero, "foreground event notification registered");
+            bool transferButton = false;
+            foreach (Control control in toolbar.Controls)
+                if (control is Button && control.Text == "文件传输") transferButton = control.Enabled;
+            Assert(transferButton, "file transfer action present and enabled after connection");
             TestDirectKeyboard(native, otherThread, otherLayout);
 
             Call("ApplyKeyboardMode", "sdk");

@@ -84,6 +84,8 @@ internal sealed class Toolbar : Form
     private ContextMenuStrip qualityMenu;
     private ContextMenuStrip keyboardMenu;
     private DesktopInputForm desktopInput;
+    private FileTransferForm fileTransfer;
+    private bool waitingForFileTransfer;
     private readonly MirrorKeyboardLayout keyboardLayout = new MirrorKeyboardLayout();
     private Native.WinEventProc foregroundChanged;
     private IntPtr foregroundHook;
@@ -101,6 +103,7 @@ internal sealed class Toolbar : Form
     private string deviceSerial;
     private float scale;
     private string logPath;
+    private readonly object fileTransferLock = new object();
 
     public Toolbar()
     {
@@ -146,11 +149,22 @@ internal sealed class Toolbar : Form
         AddAction("桌面", "返回设备桌面 · Alt+H", 0x48, false, ref y);
         AddAction("任务", "最近任务 · Alt+S", 0x53, false, ref y);
         y += 4;
-        AddAction("关屏", "关闭设备屏幕，继续投屏 · Alt+O", 0x4F, false, ref y);
-        AddAction("亮屏", "点亮设备屏幕 · Alt+Shift+O", 0x4F, true, ref y);
+        AddHalfAction("关屏", "关闭设备屏幕，继续投屏 · Alt+O", 0x4F, false, 7, y);
+        AddHalfAction("亮屏", "点亮设备屏幕 · Alt+Shift+O", 0x4F, true, 46, y);
+        y += 36;
         y += 4;
-        AddAction("音量 +", "增加音量 · Alt+↑", 0x26, false, ref y);
-        AddAction("音量 −", "降低音量 · Alt+↓", 0x28, false, ref y);
+        var volumeIcon = new Label {
+            Text = "🔊", TextAlign = ContentAlignment.MiddleCenter,
+            Font = new Font("Segoe UI Emoji", 10f),
+            BackColor = Color.FromArgb(43, 49, 60),
+            ForeColor = Color.FromArgb(235, 239, 245)
+        };
+        volumeIcon.SetBounds(S(7), S(y), S(24), S(32));
+        tips.SetToolTip(volumeIcon, "设备音量");
+        Controls.Add(volumeIcon);
+        AddHalfAction("+", "增加音量 · Alt+↑", 0x26, false, 31, y, 25);
+        AddHalfAction("−", "降低音量 · Alt+↓", 0x28, false, 56, y, 25);
+        y += 36;
         y += 4;
         qualityButton = MakeButton("画质", new Rectangle(7, y, 74, 32));
         qualityButton.Click += delegate { ShowQualityMenu(); };
@@ -222,6 +236,12 @@ internal sealed class Toolbar : Form
         keyboardMenu.Items.Add(keyboardHelp);
         UpdateKeyboardTip();
 
+        Button transfer = MakeButton("文件传输", new Rectangle(7, y, 74, 32));
+        transfer.Click += delegate { OpenFileTransfer(); };
+        tips.SetToolTip(transfer, "浏览手机文件，多选保存到电脑");
+        actions.Add(transfer);
+        y += 36;
+
         y += 4;
         Button exit = MakeButton("退出投屏", new Rectangle(7, y, 74, 32));
         exit.BackColor = Color.FromArgb(104, 47, 54);
@@ -268,6 +288,12 @@ internal sealed class Toolbar : Form
             StartMirror();
             UpdateDirectKeyboard(); follow.Start();
         };
+        FormClosing += delegate(object sender, FormClosingEventArgs e) {
+            if (fileTransfer == null || fileTransfer.IsDisposed || !fileTransfer.IsBusy) return;
+            e.Cancel = true;
+            waitingForFileTransfer = true;
+            fileTransfer.Close();
+        };
         FormClosed += delegate {
             closing = true;
             if (foregroundHook != IntPtr.Zero) Native.UnhookWinEvent(foregroundHook);
@@ -275,6 +301,7 @@ internal sealed class Toolbar : Form
             follow.Stop(); follow.Dispose(); qualityMenu.Dispose();
             keyboardMenu.Dispose(); tips.Dispose();
             if (desktopInput != null) desktopInput.Dispose();
+            if (fileTransfer != null) fileTransfer.Close();
         };
     }
 
@@ -375,6 +402,16 @@ internal sealed class Toolbar : Form
         return b;
     }
 
+    private void AddHalfAction(string text, string tip, ushort key, bool shift, int x, int y, int width = 35)
+    {
+        Button b = MakeButton(text, new Rectangle(x, y, width, 32));
+        b.Padding = Padding.Empty;
+        if (text.Length > 2) b.Font = new Font(Font.FontFamily, 8f);
+        b.Click += delegate { SendShortcut(key, shift); };
+        tips.SetToolTip(b, tip);
+        actions.Add(b);
+    }
+
     private void ShowQualityMenu()
     {
         if (!ready || restarting) return;
@@ -451,6 +488,18 @@ internal sealed class Toolbar : Form
     }
 
     internal void RequestDesktopChineseRecovery() { keyboardLayout.RequestChineseRecovery(); }
+
+    private void OpenFileTransfer()
+    {
+        if (!ready || restarting || exitRequested) return;
+        if (fileTransfer == null || fileTransfer.IsDisposed)
+        {
+            fileTransfer = new FileTransferForm(Path.Combine(root, "adb.exe"), deviceSerial);
+            fileTransfer.FormClosed += delegate { if (waitingForFileTransfer && !IsDisposed) Close(); };
+        }
+        if (!fileTransfer.Visible) fileTransfer.Show(this);
+        fileTransfer.Activate();
+    }
 
     private void OpenDesktopInput()
     {
@@ -602,7 +651,8 @@ internal sealed class Toolbar : Form
             Environment.NewLine + "启动参数：" + arguments + Environment.NewLine, Encoding.UTF8);
         var info = new ProcessStartInfo(exe, arguments) {
             WorkingDirectory = root, UseShellExecute = false, CreateNoWindow = true,
-            RedirectStandardOutput = true, RedirectStandardError = true
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
         };
         info.EnvironmentVariables["ADB"] = Path.Combine(root, "adb.exe");
         mirror = new Process { StartInfo = info };
@@ -625,12 +675,53 @@ internal sealed class Toolbar : Form
     private void LogLine(object sender, DataReceivedEventArgs e)
     {
         if (e.Data == null) return;
+        // Only the arrow-marked device is the one selected by scrcpy.
+        Match selected = Regex.Match(e.Data, @"-->\s+\([^)]*\)\s+(\S+)\s+device(?:\s|$)");
+        if (selected.Success) deviceSerial = selected.Groups[1].Value;
         lock (logLock)
         {
             recentLog.AppendLine(e.Data);
             if (recentLog.Length > 6000) recentLog.Remove(0, recentLog.Length - 6000);
             try { File.AppendAllText(logPath, e.Data + Environment.NewLine, Encoding.UTF8); } catch { }
         }
+        string source, destination;
+        if (FilePush.TryReadFailure(e.Data, out source, out destination))
+        {
+            string serial = deviceSerial;
+            ThreadPool.QueueUserWorkItem(delegate {
+                lock (fileTransferLock)
+                {
+                    NotifyFileTransfer("正在补传", "正在重新传输：" + Path.GetFileName(source));
+                    try
+                    {
+                        FilePush.Send(Path.Combine(root, "adb.exe"), serial, source, destination);
+                        NotifyFileTransfer("文件已传送", "已保存到设备：" + destination);
+                    }
+                    catch (Exception ex)
+                    {
+                        NotifyFileTransfer("文件传输失败", ex.Message);
+                    }
+                }
+            });
+        }
+    }
+
+    private void NotifyFileTransfer(string message, string details)
+    {
+        lock (logLock)
+        {
+            try { File.AppendAllText(logPath, "工具栏文件传输：" + message + " " + details + Environment.NewLine, Encoding.UTF8); } catch { }
+        }
+        try
+        {
+            BeginInvoke((Action)delegate {
+                if (closing || IsDisposed) return;
+                status.Text = message;
+                tips.SetToolTip(status, details);
+                tips.Show(details, this, S(5), Height - S(20), 6000);
+            });
+        }
+        catch (InvalidOperationException) { }
     }
     private void Poll(object sender, EventArgs e)
     {
@@ -728,7 +819,7 @@ internal sealed class Toolbar : Form
             rect.Right >= bounds.Right - 2 && rect.Bottom >= bounds.Bottom - 2;
         if (fullscreen != wasFullscreen) SetCollapsed(fullscreen);
         if (fullscreen && !collapsed && !dragging && !qualityMenu.Visible && !keyboardMenu.Visible &&
-            (desktopInput == null || !desktopInput.Visible) &&
+            (desktopInput == null || !desktopInput.Visible) && (fileTransfer == null || !fileTransfer.Visible) &&
             !Bounds.Contains(Cursor.Position) &&
             (DateTime.UtcNow - lastInteraction).TotalSeconds >= 3) SetCollapsed(true);
         fullscreenButton.Text = fullscreen ? "退出全屏" : "全屏";
@@ -736,7 +827,8 @@ internal sealed class Toolbar : Form
         // Raise the toolbar without activating it only while this mirror is active.
         IntPtr foreground = Native.GetForegroundWindow();
         SetFullscreenLayer(fullscreen && (foreground == target ||
-            (desktopInput != null && desktopInput.Visible && foreground == desktopInput.Handle)));
+            (desktopInput != null && desktopInput.Visible && foreground == desktopInput.Handle) ||
+            (fileTransfer != null && fileTransfer.Visible && foreground == fileTransfer.Handle)));
         Rectangle work = fullscreen ? bounds : screen.WorkingArea;
         if (dragging) return;
         if (fullscreen && fullscreenFloating)
@@ -811,6 +903,80 @@ internal sealed class Toolbar : Form
 // Change only the verified mirror thread's keyboard layout. A non-IME layout
 // lets SDL receive the original Shift/letter/number events instead of Windows
 // consuming them as a separate composition. UHID already forwards those events.
+internal static class FilePush
+{
+    internal static bool TryReadFailure(string line, out string source, out string destination)
+    {
+        source = destination = null;
+        Match match = Regex.Match(line, @"^ERROR: Failed to push (.+) to (/.*)$");
+        if (!match.Success) return false;
+        source = match.Groups[1].Value;
+        string name = Path.GetFileName(source);
+        if (string.IsNullOrEmpty(name)) return false;
+        destination = match.Groups[2].Value.TrimEnd('/') + "/" + name;
+        return true;
+    }
+
+    internal static string BuildArguments(string serial, string source, string destination)
+    {
+        if (string.IsNullOrEmpty(serial))
+            throw new InvalidOperationException("未能确认投屏设备，请退出后通过工具栏重新启动投屏，再拖入文件。");
+        return "-s " + Quote(serial) + " push " + Quote(source) + " " + Quote(destination);
+    }
+
+    // Windows CommandLineToArgvW quoting, including trailing backslashes.
+    internal static string Quote(string value)
+    {
+        var result = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char ch in value)
+        {
+            if (ch == '\\') { slashes++; continue; }
+            result.Append('\\', ch == '"' ? slashes * 2 + 1 : slashes);
+            result.Append(ch);
+            slashes = 0;
+        }
+        result.Append('\\', slashes * 2);
+        return result.Append('"').ToString();
+    }
+
+    internal static void Send(string adb, string serial, string source, string destination)
+    {
+        string arguments = BuildArguments(serial, source, destination);
+        if (!File.Exists(source)) throw new FileNotFoundException("找不到要传输的电脑文件。", source);
+        var output = new StringBuilder();
+        var info = new ProcessStartInfo(adb, arguments) {
+            UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
+        };
+        using (var process = new Process { StartInfo = info })
+        {
+            DataReceivedEventHandler collect = delegate(object sender, DataReceivedEventArgs e) {
+                if (e.Data == null) return;
+                lock (output)
+                {
+                    output.AppendLine(e.Data);
+                    if (output.Length > 8000) output.Remove(0, output.Length - 8000);
+                }
+            };
+            process.OutputDataReceived += collect;
+            process.ErrorDataReceived += collect;
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            if (!process.WaitForExit(600000))
+            {
+                process.Kill();
+                throw new IOException("文件传输超过 10 分钟，请检查设备连接后重试。");
+            }
+            process.WaitForExit();
+            if (process.ExitCode != 0)
+                throw new IOException("文件传输失败：\n" + output.ToString().Trim());
+        }
+    }
+}
+
 internal sealed class MirrorKeyboardLayout : IDisposable
 {
     private static readonly uint OwnPid = (uint)Process.GetCurrentProcess().Id;
@@ -1228,6 +1394,7 @@ internal static class Native
             pid == mirrorPid) return false;
         if (pid == ownPid)
         {
+            if (Control.FromHandle(window) is FileTransferForm) return true;
             // The optional desktop text editor is a real typing surface;
             // toolbar buttons and menus must still be skipped as focus hops.
             IntPtr input = FocusedInputWindow(window);
